@@ -1,0 +1,138 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>VAE Architecture - Sequential Multi-Modal Cross-Attention</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            background-color: white;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        .mermaid {
+            display: flex;
+            justify-content: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>VAE Architecture - Sequential Cross-Attention (No Circular Dependencies)</h1>
+    <div class="mermaid">
+graph TB
+    subgraph "ENCODER - Three Branches with Attention"
+        H[Heatmap 64x64x2] --> HC[Conv Blocks]
+        HC --> HC2[4x4x256]
+        HC2 --> HSA[🔍 Self-Attention 2D]
+        HSA --> HF[Flatten & FC]
+        HF --> HMU[μ_h]
+        HF --> HSIG[σ_h]
+        
+        O[Occupancy 7x8x1] --> OC[Conv Blocks]
+        OC --> OC2[7x8x32]
+        OC2 --> OSA[🔍 Self-Attention 2D]
+        OSA --> OF[Flatten & FC]
+        OF --> OMU[μ_o]
+        OF --> OSIG[σ_o]
+        
+        I[Impedance 231x1] --> IC[MLP Layers]
+        IC --> IC2[128-dim]
+        IC2 --> ISA[🔍 Self-Attention 1D]
+        ISA --> IMU[μ_i]
+        ISA --> ISIG[σ_i]
+    end
+    
+    subgraph "FUSION"
+        HMU --> POE[⚙️ Product of Experts<br/>Precision-Weighted Fusion]
+        OMU --> POE
+        IMU --> POE
+        HSIG --> POE
+        OSIG --> POE
+        ISIG --> POE
+        POE --> Z[z latent vector]
+    end
+    
+    subgraph "DECODER - Sequential Cross-Attention (No Circular Dependencies)"
+        Z --> IMPD[Impedance Decoder]
+        IMPD --> IMPOUT[Impedance 231x1]
+        
+        Z --> D1[Heatmap Decoder]
+        D1 --> D2[Upsample to 16x16x128]
+        D2 --> DSA[🔍 Self-Attention 2D]
+        
+        Z --> OCCD[Occupancy Decoder]
+        OCCD --> OCCD2[Reshape to 7x8x32]
+        OCCD2 --> OCCSA[🔍 Self-Attention 2D]
+        
+        IMPOUT --> PROJB[Project Impedance]
+        OCCSA --> PROJO[Project Initial Occupancy]
+        
+        DSA --> HCA1["⚡ Step 1: Heatmap ← Impedance"]
+        PROJB -.->HCA1
+        HCA1 --> HCA2["⚡ Step 2: Heatmap ← Occupancy (initial)"]
+        PROJO -.->HCA2
+        
+        HCA2 --> PROJH[Project Updated Heatmap]
+        
+        OCCSA --> OCA1["⚡ Step 3: Occupancy ← Impedance"]
+        PROJB -.->OCA1
+        OCA1 --> OCA2["⚡ Step 4: Occupancy ← Heatmap (updated)"]
+        PROJH -.->OCA2
+        
+        HCA2 --> HFINAL[Final Conv Layers]
+        HFINAL --> HOUT[Heatmap 64x64x2]
+        
+        OCA2 --> OFINAL[Final Conv Layers]
+        OFINAL --> OCCOUT[Occupancy 7x8x1]
+    end
+    
+    style HSA fill:#ff9999
+    style OSA fill:#ff9999
+    style ISA fill:#ffcc99
+    style DSA fill:#ff9999
+    style OCCSA fill:#ff9999
+    style HCA1 fill:#99ccff
+    style HCA2 fill:#99ccff
+    style OCA1 fill:#99ccff
+    style OCA2 fill:#99ccff
+    style POE fill:#99ff99
+    style PROJH fill:#ffff99
+    </div>
+    
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+    
+    <div style="margin-top: 30px; padding: 20px; background-color: #f5f5f5; border-radius: 5px;">
+        <h2>Architecture Highlights:</h2>
+        <ul>
+            <li><strong>Encoder:</strong> Three independent branches with self-attention for each modality</li>
+            <li><strong>Self-Attention 2D (🔍 red):</strong> Heatmap (4×4×256) and Occupancy (7×8×32) encoders</li>
+            <li><strong>Self-Attention 1D (🔍 orange):</strong> Impedance (128-dim) encoder with frequency gating</li>
+            <li><strong>PoE Fusion (⚙️ green):</strong> Precision-weighted combining of all three expert distributions</li>
+            <li><strong>Decoder Self-Attention (🔍 red):</strong> Heatmap (16×16) and Occupancy (7×8) decoders set global structure</li>
+            <li><strong>Sequential Cross-Attention (⚡ blue):</strong>
+                <ul>
+                    <li><strong>Step 1:</strong> Heatmap ← Impedance</li>
+                    <li><strong>Step 2:</strong> Heatmap ← Occupancy (initial features)</li>
+                    <li><strong>Step 3:</strong> Occupancy ← Impedance</li>
+                    <li><strong>Step 4:</strong> Occupancy ← Heatmap (<span style="background-color: #ffff99; padding: 2px 4px;">updated</span> features, not stale!)</li>
+                    <li>✅ Avoids circular gradient dependencies</li>
+                    <li>✅ Occupancy sees heatmap AFTER heatmap attended to occupancy</li>
+                </ul>
+            </li>
+            <li><strong>Three-Stage Decoding:</strong> Stage 1 (self-attention) → Stage 2 (sequential cross-attention) → Stage 3 (refinement)</li>
+            <li><strong>All Modalities Inform Each Other:</strong> Captures full physical relationships without circular dependencies</li>
+        </ul>
+    </div>
+    
+    <div style="margin-top: 20px; padding: 10px; text-align: center; color: #666; font-size: 12px;">
+        <p>To save as image: Right-click on diagram → "Save image as..." or use browser screenshot (Ctrl+Shift+S in Firefox/Chrome)</p>
+    </div>
+</body>
+</html>
