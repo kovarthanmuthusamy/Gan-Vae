@@ -155,7 +155,7 @@ if __name__ == "__main__":
     from model.vae_multi_input import MultiInputVAE
     
     print("Creating model...")
-    model = MultiInputVAE(latent_dim=128, use_cross_attn=True)
+    model = MultiInputVAE(latent_dim=128)
     
     print("\nInitial gamma values (should all be 0):")
     log_gamma_values(model, epoch=0)

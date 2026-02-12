@@ -32,13 +32,12 @@ from model.vae_multi_input import MultiInputVAE
 # ============================================================
 
 # --- Model Configuration ---
-CHECKPOINT_PATH = "experiments/exp010/checkpoints/epoch_100.pt"  # Path to trained model checkpoint
-MODEL_LATENT_DIM = 128          # Latent dimension (must match training)
-MODEL_HIDDEN_DIM = 512          # Hidden dimension (must match training)
+CHECKPOINT_PATH = "experiments/exp011/checkpoints/epoch_150.pt"  # Path to trained model checkpoint
+MODEL_LATENT_DIM = 200          # Latent dimension (must match training)
 
 # --- Generation Configuration ---
 NUM_SAMPLES = 3               # Number of samples to generate
-OUTPUT_DIR = "experiments/exp010/visuals"  # Directory to save outputs
+OUTPUT_DIR = "experiments/exp011/visuals"  # Directory to save outputs
 SAVE_DATA = True                # Save raw .npy data files
 SAVE_PLOTS = True               # Save visualization plots
 
@@ -51,7 +50,6 @@ class VAEInference:
     
     def __init__(self, checkpoint_path: str, 
                  latent_dim: int = MODEL_LATENT_DIM,
-                 hidden_dim: int = MODEL_HIDDEN_DIM,
                  device: Optional[torch.device] = None):
         """
         Initialize inference engine
@@ -59,20 +57,18 @@ class VAEInference:
         Args:
             checkpoint_path: Path to trained model checkpoint
             latent_dim: Latent dimension (must match training)
-            hidden_dim: Hidden dimension (must match training)
             device: torch device (cuda or cpu)
         """
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_path = checkpoint_path
         self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
         
         # Load model
         print(f"Loading checkpoint from: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         # Initialize model
-        self.model = MultiInputVAE(latent_dim=latent_dim, hidden_dim=hidden_dim)
+        self.model = MultiInputVAE(latent_dim=latent_dim)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(self.device)
         self.model.eval()
@@ -142,8 +138,6 @@ def main():
                       help=f'Number of samples to generate (default: {NUM_SAMPLES})')
     parser.add_argument('--latent-dim', type=int, default=MODEL_LATENT_DIM,
                       help=f'Latent dimension (default: {MODEL_LATENT_DIM})')
-    parser.add_argument('--hidden-dim', type=int, default=MODEL_HIDDEN_DIM,
-                      help=f'Hidden dimension (default: {MODEL_HIDDEN_DIM})')
     parser.add_argument('--cpu', action='store_true',
                       help='Force CPU usage even if CUDA is available')
     
@@ -162,14 +156,12 @@ def main():
     print(f"  Output directory: {args.output_dir}")
     print(f"  Number of samples: {args.num_samples}")
     print(f"  Latent dim: {args.latent_dim}")
-    print(f"  Hidden dim: {args.hidden_dim}")
     print(f"  Device: {device}")
     
     # Initialize inference engine
     inference = VAEInference(
         checkpoint_path=args.checkpoint,
         latent_dim=args.latent_dim,
-        hidden_dim=args.hidden_dim,
         device=device
     )
     

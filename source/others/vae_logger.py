@@ -107,6 +107,38 @@ class VAETrainingLogger:
             occupancy_loss=loss_dict['occupancy_loss'],
             impedance_loss=loss_dict['impedance_loss']
         )
+
+    # ------------------------------------------------------------------
+    # Console helpers for consistent messaging during training
+    # ------------------------------------------------------------------
+
+    def info(self, message: str):
+        print(message)
+
+    def log_environment(self, device, exp_path, log_path, checkpoint_path):
+        self.info(f"Device: {device}")
+        self.info(f"Experiment: {exp_path}")
+        self.info(f"Logs: {log_path}")
+        self.info(f"Checkpoints: {checkpoint_path}")
+
+    def log_beta_schedule(self, start_epoch: int, end_epoch: int, max_beta: float):
+        self.info(f"KL Annealing: β ramps 0 → {max_beta} (epochs {start_epoch}-{end_epoch})")
+
+    def log_data_source(self, data_dir: str):
+        self.info(f"\nLoading data from: {data_dir}")
+
+    def log_dataset_overview(self, dataset_size, num_batches: int):
+        self.info(f"\nDataset: {dataset_size} samples, {num_batches} batches")
+
+    def log_epoch_progress(self, epoch: int, num_epochs: int, beta: float,
+                           train_loss: float, val_loss: float):
+        self.info(
+            f"Epoch {epoch}/{num_epochs} | β={beta:.4f} | "
+            f"Train: {train_loss:.4f} | Val: {val_loss:.4f}"
+        )
+
+    def log_gamma_summary(self, active: int, total: int):
+        self.info(f"\n✅ Training Complete! {active}/{total} attention layers active (|γ| > 0.1)")
     
     def save_checkpoint(self, epoch: int, model: torch.nn.Module, 
                        optimizer: Optional[torch.optim.Optimizer] = None,

@@ -155,7 +155,7 @@ class VAELoss(nn.Module):
         
         self.mse_loss = nn.MSELoss(reduction='mean')
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='mean')
-    
+        self.mae_loss = nn.L1Loss(reduction='mean')
     def forward(self, outputs: Dict[str, torch.Tensor],
                 heatmap_target: torch.Tensor,
                 occupancy_target: torch.Tensor,
@@ -196,19 +196,18 @@ class VAELoss(nn.Module):
         
         # Reconstruction losses
         # SSIM loss for heatmap (perceptual similarity)
-        heatmap_loss = ssim_loss(heatmap_recon, heatmap_target)
+        #heatmap_loss = ssim_loss(heatmap_recon, heatmap_target)
+        heatmap_loss = self.mae_loss(heatmap_recon, heatmap_target) 
         
         # Hybrid occupancy loss: BCE + Dice for better segmentation
         occupancy_bce = self.bce_loss(occupancy_logits, occupancy_target)
-        occupancy_dice = dice_loss(occupancy_logits, occupancy_target)
-        occupancy_loss = (self.occupancy_bce_weight * occupancy_bce + 
-                         self.occupancy_dice_weight * occupancy_dice)
+        #occupancy_dice = dice_loss(occupancy_logits, occupancy_target)
+        occupancy_loss = occupancy_bce 
         
         # Hybrid impedance loss: Cosine Similarity (pattern/shape) + MSE (magnitude)
-        impedance_cosine = cosine_similarity_loss(impedance_recon, impedance_target)
-        impedance_mse = self.mse_loss(impedance_recon, impedance_target)
-        impedance_loss = (self.impedance_cosine_weight * impedance_cosine + 
-                         self.impedance_mse_weight * impedance_mse)
+        #impedance_cosine = cosine_similarity_loss(impedance_recon, impedance_target)
+        impedance_mse = self.mae_loss(impedance_recon, impedance_target)
+        impedance_loss = impedance_mse
         
         # Weighted reconstruction loss
         recon_loss = (self.heatmap_weight * heatmap_loss +
@@ -229,10 +228,10 @@ class VAELoss(nn.Module):
             'recon_loss': recon_loss,
             'heatmap_loss': heatmap_loss,
             'occupancy_loss': occupancy_loss,
-            'occupancy_bce': occupancy_bce,
-            'occupancy_dice': occupancy_dice,
+           # 'occupancy_bce': occupancy_bce,
+            #'occupancy_dice': occupancy_dice,
             'impedance_loss': impedance_loss,
-            'impedance_cosine': impedance_cosine,
-            'impedance_mse': impedance_mse,
+            #'impedance_cosine': impedance_cosine,
+            #'impedance_mse': impedance_mse,
             'kl_loss': kl_loss
         }

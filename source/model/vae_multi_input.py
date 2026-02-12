@@ -1,13 +1,22 @@
 """
-Variational Autoencoder (VAE) with Multi-Input, Multi-Output Architecture
-featuring Product of Experts (PoE) Latent Space Fusion
+Variational Autoencoder (VAE) with multi-input, multi-output architecture
+featuring mid-layer fusion at 8x8 resolution.
 
 Architecture Overview:
-    - Three independent expert encoders (one per modality)
-    - Each expert directly produces latent distribution parameters (μ, σ)
-    - Product of Experts (PoE) fusion: combines expert distributions using precision-weighted averaging
-    - Deep fusion bottleneck (3 FC layers): learns non-linear correlations between modalities
+    ENCODER (Mid-Layer Fusion):
+    - Three independent branches process to 8x8x128:
+      * Heatmap: 64x64x2 → Conv layers → 8x8x128
+      * Occupancy: 7x8x1 → Conv + Upsample → 8x8x128
+      * Impedance: 231 → MLP (231→512→8192) → reshape → 8x8x128
+    - Feature concatenation at 8x8: 384 channels (3 * 128)
+    - Fusion conv: 384 → 128 channels (1x1 conv)
+    - Self-attention at 8x8: captures cross-modal spatial relationships
+    - Continue encoding: 8x8x128 → 4x4x256 → latent space
+    
+    DECODER:
     - Three independent decoders reconstruct each modality from latent space
+    - Self-attention within each decoder captures global structure without
+      cross-modal attention layers
 
 Inputs:
     1. Heatmap: 64x64x2
@@ -20,16 +29,21 @@ Outputs:
     3. Impedance Vector: 231x1
 
 Key Benefits:
-    - Latent space equally informed by all three modalities via PoE precision weighting
-    - Deep fusion bottleneck preserves non-linear correlations (1D signal ↔ 2D image relationships)
-    - Prevents one modality from dominating the latent representation
-    - Better captures complex cross-modal dependencies
+    - 38.7% fewer parameters than early fusion (7.4M vs 12M encoder params)
+    - Each modality processes with own early layers (preserves characteristics)
+    - Fusion at abstract feature level (8x8) more natural for heterogeneous data
+    - Impedance projection: 4.3M params (vs 9M in early fusion, 52% reduction)
+    - Self-attention AFTER fusion captures cross-modal dependencies
+    - Better suited for small-to-medium datasets (less overfitting risk)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Dict, cast, Optional
+from typing import Tuple, Dict, cast
+
+
+ATTENTION_GAMMA_INIT = 0.05
 
 
 def _init_weights(module):
@@ -65,7 +79,7 @@ class SelfAttention2D(nn.Module):
         self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
         self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         # Learnable scaling parameter for residual connection
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.full((1,), ATTENTION_GAMMA_INIT))
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -101,7 +115,7 @@ class SelfAttention1D(nn.Module):
         # Simple MLP-based attention for 1D features
         self.attention_fc = nn.Linear(in_features, in_features)
         # Learnable scaling parameter for residual connection
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.full((1,), ATTENTION_GAMMA_INIT))
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -118,291 +132,139 @@ class SelfAttention1D(nn.Module):
         return self.gamma * out + x
 
 
-class CrossAttention(nn.Module):
-    """Cross-Attention: allows one modality to attend to another (e.g., heatmap attends to impedance)"""
-    
-    def __init__(self, query_channels: int, kv_dim: int, embed_dim: int = 128):
-        super(CrossAttention, self).__init__()
-        self.embed_dim = embed_dim
-        self.scale = embed_dim ** -0.5
-        
-        # Project 2D queries to embedding space
-        self.query_proj = nn.Conv2d(query_channels, embed_dim, kernel_size=1)
-        # Project 1D key/value to embedding space
-        self.key_proj = nn.Linear(kv_dim, embed_dim)
-        self.value_proj = nn.Linear(kv_dim, embed_dim)
-        # Project attention output back to original channels
-        self.out_proj = nn.Conv2d(embed_dim, query_channels, kernel_size=1)
-        
-        # Learnable scaling for residual
-        self.gamma = nn.Parameter(torch.zeros(1))
-        
-    def forward(self, query_features: torch.Tensor, kv_features: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            query_features: (B, C_q, H, W) - spatial features (e.g., heatmap)
-            kv_features: (B, C_kv) - vector features (e.g., impedance)
-        Returns:
-            out: (B, C_q, H, W) - attended features
-        """
-        B, C_q, H, W = query_features.size()
-        
-        # Project queries from spatial features
-        q = self.query_proj(query_features)  # (B, embed_dim, H, W)
-        q = q.view(B, self.embed_dim, H * W).permute(0, 2, 1)  # (B, HW, embed_dim)
-        
-        # Project key and value from 1D features
-        k = self.key_proj(kv_features).unsqueeze(1)  # (B, 1, embed_dim)
-        v = self.value_proj(kv_features).unsqueeze(1)  # (B, 1, embed_dim)
-        
-        # Compute attention: Q * K^T
-        attn = torch.bmm(q, k.transpose(1, 2)) * self.scale  # (B, HW, 1)
-        attn = F.softmax(attn, dim=1)  # Softmax over spatial positions
-        
-        # Apply attention to values
-        out = torch.bmm(attn, v)  # (B, HW, embed_dim)
-        out = out.permute(0, 2, 1).view(B, self.embed_dim, H, W)  # (B, embed_dim, H, W)
-        
-        # Project back to original channels
-        out = self.out_proj(out)  # (B, C_q, H, W)
-        
-        # Residual connection with learnable scaling
-        return self.gamma * out + query_features
 
 
-class HeatmapEncoder(nn.Module):
-    """Expert encoder for 64x64x2 heatmap input - produces latent distribution"""
+class HeatmapBranch(nn.Module):
+    """Heatmap encoder branch: 64x64x2 → 8x8x128"""
     
-    def __init__(self, latent_dim: int = 128):
-        super(HeatmapEncoder, self).__init__()
-        self.latent_dim = latent_dim
+    def __init__(self):
+        super(HeatmapBranch, self).__init__()
         
-        # Conv layers to compress 64x64x2 to feature vector
+        # Conv layers to compress heatmap to 8x8x128
         self.conv1 = nn.Conv2d(2, 32, kernel_size=4, stride=2, padding=1)  # 32x32
         self.bn1 = nn.BatchNorm2d(32)
+        
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1)  # 16x16
         self.bn2 = nn.BatchNorm2d(64)
+        
         self.conv3 = nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1)  # 8x8
         self.bn3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1)  # 4x4
-        self.bn4 = nn.BatchNorm2d(256)
-        
-        # Self-Attention after last conv block (before flattening)
-        # This helps encoder "summarize" global structure
-        self.self_attn = SelfAttention2D(256)
-        
-        # Flatten: 256 * 4 * 4 = 4096
-        self.fc_hidden = nn.Linear(256 * 4 * 4, 512)
-        self.fc_mu = nn.Linear(512, latent_dim)
-        self.fc_logvar = nn.Linear(512, latent_dim)
         
         self.apply(_init_weights)
         
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (batch_size, 2, 64, 64)
         Returns:
-            mu: (batch_size, latent_dim)
-            logvar: (batch_size, latent_dim)
+            features: (batch_size, 128, 8, 8)
         """
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))  # (B, 256, 4, 4)
-        
-        # Apply self-attention to capture global structure before flattening
-        x = self.self_attn(x)  # (B, 256, 4, 4)
-        
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc_hidden(x))
-        
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
+        x = F.relu(self.bn1(self.conv1(x)))  # (B, 32, 32, 32)
+        x = F.relu(self.bn2(self.conv2(x)))  # (B, 64, 16, 16)
+        x = F.relu(self.bn3(self.conv3(x)))  # (B, 128, 8, 8)
+        return x
 
 
-class OccupancyEncoder(nn.Module):
-    """Expert encoder for 7x8x1 binary occupancy map - produces latent distribution"""
+class OccupancyBranch(nn.Module):
+    """Occupancy encoder branch: 7x8x1 → 8x8x128"""
     
-    def __init__(self, latent_dim: int = 128):
-        super(OccupancyEncoder, self).__init__()
-        self.latent_dim = latent_dim
+    def __init__(self):
+        super(OccupancyBranch, self).__init__()
         
         # Conv layers for small spatial input
         self.conv1 = nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1)  # 7x8
         self.bn1 = nn.BatchNorm2d(16)
+        
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)  # 7x8
         self.bn2 = nn.BatchNorm2d(32)
         
-        # Self-Attention for occupancy spatial features
-        self.self_attn = SelfAttention2D(32)
+        # Bilinear upsample to 8x8 (no parameters)
+        self.upsample = nn.Upsample(size=(8, 8), mode='bilinear', align_corners=False)
         
-        self.fc_hidden = nn.Linear(32 * 7 * 8, 256)
-        self.fc_mu = nn.Linear(256, latent_dim)
-        self.fc_logvar = nn.Linear(256, latent_dim)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)  # 8x8
+        self.bn3 = nn.BatchNorm2d(64)
+        
+        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)  # 8x8
+        self.bn4 = nn.BatchNorm2d(128)
         
         self.apply(_init_weights)
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (batch_size, 1, 7, 8)
         Returns:
-            mu: (batch_size, latent_dim)
-            logvar: (batch_size, latent_dim)
+            features: (batch_size, 128, 8, 8)
         """
-        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn1(self.conv1(x)))  # (B, 16, 7, 8)
         x = F.relu(self.bn2(self.conv2(x)))  # (B, 32, 7, 8)
-        
-        # Apply self-attention to capture spatial relationships
-        x = self.self_attn(x)  # (B, 32, 7, 8)
-        
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc_hidden(x))
-        
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
+        x = self.upsample(x)  # (B, 32, 8, 8) - bilinear interpolation
+        x = F.relu(self.bn3(self.conv3(x)))  # (B, 64, 8, 8)
+        x = F.relu(self.bn4(self.conv4(x)))  # (B, 128, 8, 8)
+        return x
 
 
-class ImpedanceEncoder(nn.Module):
-    """Expert encoder for 231x1 impedance vector - produces latent distribution"""
+class ImpedanceBranch(nn.Module):
+    """Impedance encoder branch: 231x1 → 8x8x128 (via MLP then reshape)"""
     
-    def __init__(self, latent_dim: int = 128):
-        super(ImpedanceEncoder, self).__init__()
-        self.latent_dim = latent_dim
+    def __init__(self):
+        super(ImpedanceBranch, self).__init__()
         
-        # MLP for 1D vector
-        self.fc1 = nn.Linear(231, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.BatchNorm1d(128)
+        # MLP: 231 → 512 → 8192 (= 8*8*128)
+        self.fc1 = nn.Linear(231, 512)
+        self.bn1 = nn.BatchNorm1d(512)
         
-        # Self-Attention for impedance frequency features
-        self.self_attn = SelfAttention1D(128)
-        
-        self.fc_mu = nn.Linear(128, latent_dim)
-        self.fc_logvar = nn.Linear(128, latent_dim)
+        self.fc2 = nn.Linear(512, 8 * 8 * 128)  # 8192
+        self.bn2 = nn.BatchNorm1d(8 * 8 * 128)
         
         self.apply(_init_weights)
         
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (batch_size, 231)
         Returns:
-            mu: (batch_size, latent_dim)
-            logvar: (batch_size, latent_dim)
+            features: (batch_size, 128, 8, 8)
         """
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = F.relu(self.bn2(self.fc2(x)))  # (B, 128)
+        x = F.relu(self.bn1(self.fc1(x)))  # (B, 512)
+        x = F.relu(self.bn2(self.fc2(x)))  # (B, 8192)
         
-        # Apply self-attention to capture frequency relationships
-        x = self.self_attn(x)  # (B, 128)
-        
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
+        # Reshape to spatial: (B, 8192) → (B, 128, 8, 8)
+        x = x.view(x.size(0), 128, 8, 8)
+        return x
 
 
-class PoEFusion(nn.Module):
-    """
-    Product of Experts (PoE) Fusion Layer
+class MidLayerFusionEncoder(nn.Module):
+    """Mid-layer fusion encoder: fuses modalities at 8x8 resolution before self-attention"""
     
-    Combines multiple Gaussian distributions from different modality experts
-    using the product of Gaussians formula. This ensures the latent space is 
-    equally informed by all modalities while preserving non-linear correlations.
-    """
-    
-    def __init__(self, latent_dim: int = 128, num_experts: int = 3):
-        super(PoEFusion, self).__init__()
+    def __init__(self, latent_dim: int = 128):
+        super(MidLayerFusionEncoder, self).__init__()
         self.latent_dim = latent_dim
-        self.num_experts = num_experts
         
-        # Prior variance for numerical stability
-        self.register_buffer('prior_var', torch.tensor([0.1]))
+        # Three separate branches process to 8x8x128
+        self.heatmap_branch = HeatmapBranch()
+        self.occupancy_branch = OccupancyBranch()
+        self.impedance_branch = ImpedanceBranch()
         
-    def forward(self, expert_mus: torch.Tensor, expert_logvars: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Fuse expert distributions using Product of Experts
+        # Fusion: concatenate 3 * 128 = 384 channels → reduce to 128
+        self.fusion_conv = nn.Conv2d(384, 128, kernel_size=1)  # 1x1 conv
+        self.fusion_bn = nn.BatchNorm2d(128)
         
-        Args:
-            expert_mus: (num_experts, batch_size, latent_dim)
-            expert_logvars: (num_experts, batch_size, latent_dim)
+        # Self-Attention at mid-layer (8x8) AFTER fusion to capture cross-modal relationships
+        self.self_attn = SelfAttention2D(128)
         
-        Returns:
-            fused_mu: (batch_size, latent_dim)
-            fused_logvar: (batch_size, latent_dim)
-        """
-        # Convert logvar to variance with clamping for numerical stability
-        expert_logvars_clamped = torch.clamp(expert_logvars, min=-10, max=10)
-        expert_vars = torch.exp(expert_logvars_clamped)  # (num_experts, batch_size, latent_dim)
+        # Continue encoding
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1)  # 4x4
+        self.bn4 = nn.BatchNorm2d(256)
         
-        # Compute precision (inverse variance): τ = 1/σ²
-        expert_precs = 1.0 / (expert_vars + 1e-8)  # (num_experts, batch_size, latent_dim)
+        # No attention at 4x4 - too small (16 positions), regular conv sufficient
+        # Self-attention at 8x8 already captured global/cross-modal relationships
         
+        # Fully connected layers to latent space
+        self.fc_hidden = nn.Linear(256 * 4 * 4, 512)
+        self.fc_mu = nn.Linear(512, latent_dim)
+        self.fc_logvar = nn.Linear(512, latent_dim)
         
-        # Prior precision for regularization
-        prior_var_tensor = cast(torch.Tensor, self.prior_var)
-        prior_prec = 1.0 / (prior_var_tensor + 1e-8)
-        
-        # Product of experts: combine precisions
-        # τ_combined = τ_prior + Σ(τ_i - τ_prior)
-        combined_prec = prior_prec + torch.sum(expert_precs - prior_prec, dim=0)  # (batch_size, latent_dim)
-        combined_prec = torch.clamp(combined_prec, min=1e-8)  # Ensure positive precision
-        
-        # Fused variance
-        fused_var = 1.0 / combined_prec  # (batch_size, latent_dim)
-        fused_logvar = torch.clamp(torch.log(fused_var + 1e-10), min=-10, max=10)
-        
-        # Fused mean: precision-weighted average
-        # μ_combined = (τ_prior * μ_prior + Σ(τ_i * μ_i)) / τ_combined
-        weighted_mu = torch.sum(expert_precs * expert_mus, dim=0)  # (batch_size, latent_dim)
-        fused_mu = fused_var * weighted_mu  # (batch_size, latent_dim)
-        
-        return fused_mu, fused_logvar
-
-
-class Encoder(nn.Module):
-    """
-    Unified encoder with Product of Experts (PoE) latent space fusion
-    
-    1. Each modality expert independently produces μ and σ
-    2. Expert distributions are combined using PoE (precision-weighted fusion)
-    3. Deep fusion bottleneck (2-3 dense layers) learns non-linear correlations
-    4. Final latent distribution parameters generated from fused representation
-    """
-    
-    def __init__(self, latent_dim: int = 128, hidden_dim: int = 512):
-        super(Encoder, self).__init__()
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        
-        # Individual expert encoders for each modality
-        self.heatmap_enc = HeatmapEncoder(latent_dim)
-        self.occupancy_enc = OccupancyEncoder(latent_dim)
-        self.impedance_enc = ImpedanceEncoder(latent_dim)
-        
-        # Product of Experts fusion
-        self.poe_fusion = PoEFusion(latent_dim, num_experts=3)
-        
-        # Deep fusion bottleneck (2-3 dense layers for non-linear correlation learning)
-        # Takes fused latent params (μ and σ) as input
-        self.fusion_fc1 = nn.Linear(latent_dim * 2, hidden_dim)  # μ and logvar concatenated
-        self.fusion_bn1 = nn.BatchNorm1d(hidden_dim)
-        
-        self.fusion_fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.fusion_bn2 = nn.BatchNorm1d(hidden_dim // 2)
-        
-        self.fusion_fc3 = nn.Linear(hidden_dim // 2, hidden_dim // 2)
-        self.fusion_bn3 = nn.BatchNorm1d(hidden_dim // 2)
-        
-        # Final latent space distribution
-        self.fc_mu = nn.Linear(hidden_dim // 2, latent_dim)
-        self.fc_logvar = nn.Linear(hidden_dim // 2, latent_dim)
-        
-        # Initialize fusion layers
         self.apply(_init_weights)
         
     def forward(self, heatmap: torch.Tensor, occupancy: torch.Tensor, 
@@ -416,35 +278,76 @@ class Encoder(nn.Module):
             mu: (batch_size, latent_dim)
             logvar: (batch_size, latent_dim)
         """
-        # Encode each modality to get expert distributions
-        h_mu, h_logvar = self.heatmap_enc(heatmap)
-        o_mu, o_logvar = self.occupancy_enc(occupancy)
-        i_mu, i_logvar = self.impedance_enc(impedance)
+        # Process each modality independently to 8x8x128
+        h_feat = self.heatmap_branch(heatmap)      # (B, 128, 8, 8)
+        o_feat = self.occupancy_branch(occupancy)  # (B, 128, 8, 8)
+        i_feat = self.impedance_branch(impedance)  # (B, 128, 8, 8)
         
-        # Check for NaN/Inf in encoder outputs
-        _check_nan_inf(h_mu, "heatmap encoder mu", heatmap)
-        _check_nan_inf(o_mu, "occupancy encoder mu", occupancy)
-        _check_nan_inf(i_mu, "impedance encoder mu", impedance)
+        # Concatenate along channel dimension: 3 * 128 = 384 channels
+        fused = torch.cat([h_feat, o_feat, i_feat], dim=1)  # (B, 384, 8, 8)
         
-        # Stack expert distributions for PoE fusion
-        expert_mus = torch.stack([h_mu, o_mu, i_mu], dim=0)          # (3, batch_size, latent_dim)
-        expert_logvars = torch.stack([h_logvar, o_logvar, i_logvar], dim=0)  # (3, batch_size, latent_dim)
+        # Reduce channels with 1x1 conv
+        x = F.relu(self.fusion_bn(self.fusion_conv(fused)))  # (B, 128, 8, 8)
         
-        # Product of Experts: fuse expert distributions
-        fused_mu, fused_logvar = self.poe_fusion(expert_mus, expert_logvars)  # (batch_size, latent_dim)
+        # Mid-layer self-attention: captures cross-modal spatial relationships
+        x = self.self_attn(x)  # (B, 128, 8, 8)
         
-        # Deep fusion bottleneck: learn non-linear correlations between modalities
-        # Concatenate fused μ and logvar
-        fused_combined = torch.cat([fused_mu, fused_logvar], dim=1)  # (batch_size, latent_dim * 2)
+        # Continue encoding
+        x = F.relu(self.bn4(self.conv4(x)))  # (B, 256, 4, 4)
         
-        # Pass through 3-layer fusion bottleneck
-        x = F.relu(self.fusion_bn1(self.fusion_fc1(fused_combined)))
-        x = F.relu(self.fusion_bn2(self.fusion_fc2(x)))
-        x = F.relu(self.fusion_bn3(self.fusion_fc3(x)))
+        # Flatten and project to latent space (no attention at 4x4)
+        x = x.view(x.size(0), -1)  # (B, 4096)
+        x = F.relu(self.fc_hidden(x))  # (B, 512)
         
-        # Generate final latent distribution
         mu = self.fc_mu(x)
         logvar = self.fc_logvar(x)
+        return mu, logvar
+
+
+class Encoder(nn.Module):
+    """
+    Mid-layer fusion encoder: combines modalities at 8x8 resolution
+    
+    Architecture:
+    1. Three independent branches process each modality to 8x8x128:
+       - Heatmap: 64x64x2 → Conv layers → 8x8x128
+       - Occupancy: 7x8x1 → Conv + Upsample → 8x8x128  
+       - Impedance: 231 → MLP → 8x8x128
+    2. Concatenate at 8x8: 384 channels (3 * 128)
+    3. Fusion conv: 384 → 128 channels
+    4. Self-attention at 8x8: captures cross-modal relationships
+    5. Continue encoding to latent space
+    
+    Benefits:
+    - 38.7% fewer parameters than early fusion
+    - Each modality preserves its own characteristics initially
+    - Fusion at abstract feature level (8x8) is more natural
+    - Impedance projection: 4.3M params (vs 9M in early fusion)
+    """
+    
+    def __init__(self, latent_dim: int = 128):
+        super(Encoder, self).__init__()
+        self.latent_dim = latent_dim
+        
+        # Mid-layer fusion encoder
+        self.fusion_encoder = MidLayerFusionEncoder(latent_dim)
+        
+        self.apply(_init_weights)
+        
+    def forward(self, heatmap: torch.Tensor, occupancy: torch.Tensor, 
+                impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            heatmap: (batch_size, 2, 64, 64)
+            occupancy: (batch_size, 1, 7, 8)
+            impedance: (batch_size, 231)
+        Returns:
+            mu: (batch_size, latent_dim)
+            logvar: (batch_size, latent_dim)
+        """
+        # Process through mid-layer fusion encoder
+        mu, logvar = self.fusion_encoder(heatmap, occupancy, impedance)
+        
         return mu, logvar
     
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -458,12 +361,11 @@ class Encoder(nn.Module):
 
 
 class HeatmapDecoder(nn.Module):
-    """Decoder for 64x64x2 heatmap output with self-attention and cross-attention"""
+    """Decoder for 64x64x2 heatmap output with self-attention"""
     
-    def __init__(self, latent_dim: int = 128, use_cross_attn: bool = True):
+    def __init__(self, latent_dim: int = 128):
         super(HeatmapDecoder, self).__init__()
         self.latent_dim = latent_dim
-        self.use_cross_attn = use_cross_attn
         
         # FC layer to expand latent to 4x4x256
         self.fc = nn.Linear(latent_dim, 256 * 4 * 4)
@@ -477,10 +379,6 @@ class HeatmapDecoder(nn.Module):
         # Self-Attention at 16x16 resolution - sets "global blueprint"
         self.self_attn = SelfAttention2D(128)
         
-        # Cross-Attention: heatmap attends to impedance features
-        if self.use_cross_attn:
-            self.cross_attn = CrossAttention(query_channels=128, kv_dim=latent_dim, embed_dim=128)
-        
         self.conv2 = nn.Conv2d(128, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
         
@@ -489,11 +387,12 @@ class HeatmapDecoder(nn.Module):
         
         self.conv4 = nn.Conv2d(32, 2, kernel_size=3, padding=1)
         
-    def forward(self, z: torch.Tensor, impedance_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self.apply(_init_weights)
+        
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
         Args:
             z: (batch_size, latent_dim)
-            impedance_features: (batch_size, latent_dim) - optional for cross-attention
         Returns:
             heatmap: (batch_size, 2, 64, 64)
         """
@@ -508,10 +407,6 @@ class HeatmapDecoder(nn.Module):
         # Apply self-attention to set global blueprint
         x = self.self_attn(x)  # (B, 128, 16, 16)
         
-        # Apply cross-attention: let heatmap attend to impedance features
-        if self.use_cross_attn and impedance_features is not None:
-            x = self.cross_attn(x, impedance_features)  # (B, 128, 16, 16)
-        
         x = F.relu(self.bn2(self.conv2(x)))  # (B, 64, 16, 16)
         x = self.upsample(x)  # 32x32
         x = F.relu(self.bn3(self.conv3(x)))  # (B, 32, 32, 32)
@@ -522,12 +417,11 @@ class HeatmapDecoder(nn.Module):
 
 
 class OccupancyDecoder(nn.Module):
-    """Decoder for 7x8x1 binary occupancy map with self-attention and cross-attention"""
+    """Decoder for 7x8x1 binary occupancy map with self-attention"""
     
-    def __init__(self, latent_dim: int = 128, use_cross_attn: bool = True):
+    def __init__(self, latent_dim: int = 128):
         super(OccupancyDecoder, self).__init__()
         self.latent_dim = latent_dim
-        self.use_cross_attn = use_cross_attn
         
         # FC layer
         self.fc = nn.Linear(latent_dim, 128)
@@ -539,21 +433,18 @@ class OccupancyDecoder(nn.Module):
         # Self-Attention at 7x8x32 resolution
         self.self_attn = SelfAttention2D(32)
         
-        # Cross-Attention: occupancy attends to impedance features
-        if self.use_cross_attn:
-            self.cross_attn = CrossAttention(query_channels=32, kv_dim=latent_dim, embed_dim=64)
-        
         # Conv layers for refinement
         self.conv1 = nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
         
         self.conv2 = nn.Conv2d(16, 1, kernel_size=3, stride=1, padding=1)
         
-    def forward(self, z: torch.Tensor, impedance_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self.apply(_init_weights)
+        
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
         Args:
             z: (batch_size, latent_dim)
-            impedance_features: (batch_size, latent_dim) - optional for cross-attention
         Returns:
             occupancy: (batch_size, 1, 7, 8)
         """
@@ -563,10 +454,6 @@ class OccupancyDecoder(nn.Module):
         
         # Apply self-attention
         x = self.self_attn(x)  # (B, 32, 7, 8)
-        
-        # Apply cross-attention: let occupancy attend to impedance features
-        if self.use_cross_attn and impedance_features is not None:
-            x = self.cross_attn(x, impedance_features)  # (B, 32, 7, 8)
         
         x = F.relu(self.bn1(self.conv1(x)))
         x = self.conv2(x)  # Raw logits; apply sigmoid outside when needed
@@ -589,6 +476,8 @@ class ImpedanceDecoder(nn.Module):
         
         self.fc3 = nn.Linear(256, 231)
         
+        self.apply(_init_weights)
+        
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -603,53 +492,18 @@ class ImpedanceDecoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Unified decoder with fully symmetric cross-modal attention (all modalities inform each other)"""
+    """Unified decoder with per-modality self-attention"""
     
-    def __init__(self, latent_dim: int = 128, use_cross_attn: bool = True):
+    def __init__(self, latent_dim: int = 128):
         super(Decoder, self).__init__()
         self.latent_dim = latent_dim
-        self.use_cross_attn = use_cross_attn
         
-        self.heatmap_dec = HeatmapDecoder(latent_dim, use_cross_attn=False)  # Will add multi-modal attention separately
-        self.occupancy_dec = OccupancyDecoder(latent_dim, use_cross_attn=False)
+        self.heatmap_dec = HeatmapDecoder(latent_dim)
+        self.occupancy_dec = OccupancyDecoder(latent_dim)
         self.impedance_dec = ImpedanceDecoder(latent_dim)
-        
-        # Multi-modal cross-attention: each modality attends to the other two
-        if use_cross_attn:
-            # For Heatmap: attend to Impedance + Occupancy
-            self.heatmap_imp_attn = CrossAttention(query_channels=128, kv_dim=latent_dim, embed_dim=128)
-            self.heatmap_occ_attn = CrossAttention(query_channels=128, kv_dim=latent_dim, embed_dim=128)
-            
-            # For Occupancy: attend to Impedance + Heatmap
-            self.occ_imp_attn = CrossAttention(query_channels=32, kv_dim=latent_dim, embed_dim=64)
-            self.occ_heat_attn = CrossAttention(query_channels=32, kv_dim=latent_dim, embed_dim=64)
-            
-            # Feature projection layers
-            self.impedance_proj = nn.Linear(231, latent_dim)
-            self.heatmap_proj = nn.Sequential(
-                nn.AdaptiveAvgPool2d((1, 1)),  # Global pool 128x16x16 → 128x1x1
-                nn.Flatten(),  # → 128
-                nn.Linear(128, latent_dim)
-            )
-            self.occupancy_proj = nn.Sequential(
-                nn.AdaptiveAvgPool2d((1, 1)),  # Global pool 32x7x8 → 32x1x1
-                nn.Flatten(),  # → 32
-                nn.Linear(32, latent_dim)
-            )
-        
+    
     def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sequential cross-attention decoding to avoid circular dependencies:
-        Stage 1: Decode all modalities to intermediate representations
-        Stage 2: Apply sequential cross-attention (avoids using stale features)
-        Stage 3: Final refinement layers
-        
-        Sequential order prevents circular gradient dependencies:
-        1. Heatmap attends to Impedance
-        2. Heatmap attends to Occupancy  
-        3. Occupancy attends to Impedance
-        4. Occupancy attends to updated Heatmap (not stale features)
-        
         Args:
             z: (batch_size, latent_dim)
         Returns:
@@ -657,55 +511,9 @@ class Decoder(nn.Module):
             occupancy_logits: (batch_size, 1, 7, 8)
             impedance: (batch_size, 231)
         """
-        # Stage 1: Decode to intermediate features (before final conv layers)
-        # Impedance: fully decoded (1D, no spatial refinement needed)
+        heatmap = self.heatmap_dec(z)
+        occupancy = self.occupancy_dec(z)
         impedance = self.impedance_dec(z)
-        
-        # Heatmap: decode to 16x16x128 (before final upsampling)
-        h = F.relu(self.heatmap_dec.bn_fc(self.heatmap_dec.fc(z)))
-        h = h.view(h.size(0), 256, 4, 4)
-        h = self.heatmap_dec.upsample(h)
-        h = F.relu(self.heatmap_dec.bn1(self.heatmap_dec.conv1(h)))
-        h = self.heatmap_dec.upsample(h)  # 16x16x128
-        h = self.heatmap_dec.self_attn(h)  # Self-attention
-        
-        # Occupancy: decode to 7x8x32 (before final conv layers)
-        o = F.relu(self.occupancy_dec.bn_fc(self.occupancy_dec.fc(z)))
-        o = F.relu(self.occupancy_dec.bn_fc2(self.occupancy_dec.fc2(z)))
-        o = o.view(o.size(0), 32, 7, 8)
-        o = self.occupancy_dec.self_attn(o)  # Self-attention
-        
-        # Stage 2: Sequential cross-attention (avoids circular dependencies)
-        if self.use_cross_attn:
-            # Step 1: Project impedance features (constant, used by both)
-            imp_feat = self.impedance_proj(impedance)  # (B, latent_dim)
-            
-            # Step 2: Project initial occupancy features (before heatmap gets updated)
-            occ_feat_initial = self.occupancy_proj(o)  # (B, latent_dim)
-            
-            # Step 3: Heatmap attends to Impedance + initial Occupancy
-            h = self.heatmap_imp_attn(h, imp_feat)
-            h = self.heatmap_occ_attn(h, occ_feat_initial)
-            
-            # Step 4: Project UPDATED heatmap features (after attention)
-            heat_feat_updated = self.heatmap_proj(h)  # (B, latent_dim)
-            
-            # Step 5: Occupancy attends to Impedance + UPDATED Heatmap
-            o = self.occ_imp_attn(o, imp_feat)
-            o = self.occ_heat_attn(o, heat_feat_updated)  # Uses fresh heatmap features!
-        
-        # Stage 3: Final refinement layers
-        # Heatmap: upsample to 64x64
-        h = F.relu(self.heatmap_dec.bn2(self.heatmap_dec.conv2(h)))
-        h = self.heatmap_dec.upsample(h)
-        h = F.relu(self.heatmap_dec.bn3(self.heatmap_dec.conv3(h)))
-        h = self.heatmap_dec.upsample(h)
-        heatmap = torch.tanh(self.heatmap_dec.conv4(h))
-        
-        # Occupancy: final conv layers
-        o = F.relu(self.occupancy_dec.bn1(self.occupancy_dec.conv1(o)))
-        occupancy = self.occupancy_dec.conv2(o)
-        
         return heatmap, occupancy, impedance
 
 
@@ -724,13 +532,12 @@ class MultiInputVAE(nn.Module):
         - reconstructed_impedance: (batch_size, 231)
     """
     
-    def __init__(self, latent_dim: int = 128, hidden_dim: int = 512, use_cross_attn: bool = True):
+    def __init__(self, latent_dim: int = 128):
         super(MultiInputVAE, self).__init__()
         self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
         
-        self.encoder = Encoder(latent_dim, hidden_dim)
-        self.decoder = Decoder(latent_dim, use_cross_attn=use_cross_attn)
+        self.encoder = Encoder(latent_dim)
+        self.decoder = Decoder(latent_dim)
         
     def encode(self, heatmap: torch.Tensor, occupancy: torch.Tensor,
                impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

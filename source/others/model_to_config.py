@@ -81,8 +81,6 @@ def extract_model_architecture(model: torch.nn.Module) -> Dict[str, Any]:
     # Try to extract model-specific attributes
     if hasattr(model, 'latent_dim'):
         architecture['latent_dim'] = model.latent_dim
-    if hasattr(model, 'hidden_dim'):
-        architecture['hidden_dim'] = model.hidden_dim
     
     return architecture
 
@@ -209,8 +207,6 @@ def print_config_summary(config: Dict[str, Any]) -> None:
     
     if 'latent_dim' in model_cfg:
         print(f"  Latent Dimension:      {model_cfg.get('latent_dim')}")
-    if 'hidden_dim' in model_cfg:
-        print(f"  Hidden Dimension:      {model_cfg.get('hidden_dim')}")
     
     # Metadata
     metadata = config.get('metadata', {})
