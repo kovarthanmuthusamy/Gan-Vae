@@ -32,12 +32,12 @@ from model.vae_multi_input import MultiInputVAE
 # ============================================================
 
 # --- Model Configuration ---
-CHECKPOINT_PATH = "experiments/exp011/checkpoints/epoch_150.pt"  # Path to trained model checkpoint
-MODEL_LATENT_DIM = 200          # Latent dimension (must match training)
+CHECKPOINT_PATH = "experiments/exp012/checkpoints/checkpoint_epoch_90.pt"  # Path to trained model checkpoint
+MODEL_LATENT_DIM = 32          # Latent dimension (must match training)
 
 # --- Generation Configuration ---
-NUM_SAMPLES = 3               # Number of samples to generate
-OUTPUT_DIR = "experiments/exp011/visuals"  # Directory to save outputs
+NUM_SAMPLES = 5               # Number of samples to generate
+OUTPUT_DIR = "experiments/exp012/visuals"  # Directory to save outputs
 SAVE_DATA = True                # Save raw .npy data files
 SAVE_PLOTS = True               # Save visualization plots
 
