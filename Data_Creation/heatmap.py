@@ -46,7 +46,7 @@ def create_Heatmaps(file_path, grid_size=HEATMAP_GRID_SIZE, frame_path=None, mas
     
     points = np.column_stack((x, y))
     # Use linear interpolation (faster than cubic) and fill NaNs with nearest neighbor
-    Zi = np.flipud(griddata(points, z, (Xi, Yi), method="linear"))
+    Zi = griddata(points, z, (Xi, Yi), method="linear")
     
     # Only use RBF for significant NaN regions (more efficient)
     nan_mask = np.isnan(Zi)
@@ -81,14 +81,14 @@ def visualize_heatmap(heatmap_file, output_path=None, show=True):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     
     # Plot impedance channel
-    im0 = axes[0].imshow(impedance_ch, cmap='jet')
+    im0 = axes[0].imshow(impedance_ch, cmap='jet', origin='lower')
     axes[0].set_title('Impedance')
     axes[0].set_xlabel('X')
     axes[0].set_ylabel('Y')
     plt.colorbar(im0, ax=axes[0])
     
     # Plot mask channel
-    im1 = axes[1].imshow(mask_ch, cmap='binary')
+    im1 = axes[1].imshow(mask_ch, cmap='binary', origin='lower')
     axes[1].set_title('Mask')
     axes[1].set_xlabel('X')
     axes[1].set_ylabel('Y')

@@ -229,6 +229,7 @@ class VAELoss(nn.Module):
         # Learnable uncertainty parameters (log variance)
         # Using nn.Parameter makes them trainable
         self.log_sigma_heatmap = nn.Parameter(torch.tensor(init_log_sigma_heatmap, dtype=torch.float32))
+        self.log_sigma_max_impedance = nn.Parameter(torch.tensor(init_log_sigma_heatmap, dtype=torch.float32))  # Share initial value with heatmap
         self.log_sigma_occupancy = nn.Parameter(torch.tensor(init_log_sigma_occupancy, dtype=torch.float32))
         self.log_sigma_impedance = nn.Parameter(torch.tensor(init_log_sigma_impedance, dtype=torch.float32))
         
@@ -342,29 +343,57 @@ class VAELoss(nn.Module):
             raise ValueError(f"Unknown occupancy_loss_type: {self.occupancy_loss_type}")
 
     def forward(self, outputs: Dict[str, torch.Tensor],
-                heatmap_target: torch.Tensor,
+                heatmap_target_norm: torch.Tensor,
+                max_impedance_target_std: torch.Tensor,
                 occupancy_target: torch.Tensor,
                 impedance_target: torch.Tensor,
-                kl_weight_multiplier: float = 1.0) -> Dict[str, torch.Tensor]:
+                max_impedance_mean: float,
+                max_impedance_std: float,
+                kl_weight_multiplier: float = 1.0,
+                use_physical_loss: bool = True) -> Dict[str, torch.Tensor]:
         """
-        Calculate VAE loss with uncertainty-based weighting and KL scaling
+        Calculate VAE loss with STABILITY-FIRST PHYSICALLY-AWARE reconstruction loss.
+        
+        Key Innovation: Model outputs STANDARDIZED Z-scores for stability, but we compute
+        the physical reconstruction loss on UN-STANDARDIZED values to ensure the relationship
+        between max_impedance and heatmap shape is learned correctly.
+        
+        Workflow:
+        1. Model outputs: heatmap_norm_recon (sigmoid[0,1]), max_impedance_std_recon (Z-score)
+        2. Unstandardize: max_impedance_recon_raw = max_impedance_std_recon × std + mean
+        3. Physical Loss: MSE(heatmap_norm_pred × max_imp_pred_raw, heatmap_norm_target × max_imp_target_raw)
+        
+        Physical Reconstruction Loss:
+            heatmap_physical_pred = heatmap_norm_pred * max_impedance_pred_raw
+            heatmap_physical_target = heatmap_norm_target * max_impedance_target_raw
+            L_physical = MSE(heatmap_physical_pred, heatmap_physical_target)
+        
+        This forces the model to learn:
+        - Correct normalized shape (heatmap_norm)
+        - Correct standardized scaling factor (max_impedance_std)
+        - Their mathematical consistency via physical coupling
         
         The loss for each modality follows: L_i = (1/(2*σ_i^2)) * MSE_i + (1/2) * log(σ_i^2)
         where σ_i^2 = exp(log_sigma_i) is the learned uncertainty for modality i
         
         Args:
             outputs: Dictionary from VAE forward pass
-            heatmap_target: Target heatmap (batch_size, 2, 64, 64)
+            heatmap_target_norm: Target NORMALIZED heatmap (batch_size, 2, 64, 64) [0, 1]
+            max_impedance_target_std: Target STANDARDIZED max impedance (batch_size, 1) Z-score
             occupancy_target: Target occupancy (batch_size, 1, 7, 8)
             impedance_target: Target impedance (batch_size, 231)
+            max_impedance_mean: Mean of max_impedance in dataset (for unstandardization)
+            max_impedance_std: Std of max_impedance in dataset (for unstandardization)
             kl_weight_multiplier: Multiplier for KL weight (for annealing)
+            use_physical_loss: If True, use physical reconstruction loss; else use standardized loss
         
         Returns:
             Dictionary with loss components including uncertainty terms
         """
         mu = outputs['mu']
         logvar = outputs['logvar']
-        heatmap_recon = outputs['heatmap_recon']
+        heatmap_norm_recon = outputs['heatmap_recon']  # Normalized heatmap [0, 1]
+        max_impedance_std_recon = outputs['max_impedance_recon']  # STANDARDIZED (Z-score)
         occupancy_recon = outputs['occupancy_recon']
         occupancy_logits = outputs.get('occupancy_logits', occupancy_recon)
         impedance_recon = outputs['impedance_recon']
@@ -374,15 +403,39 @@ class VAELoss(nn.Module):
             raise ValueError("NaN or Inf detected in mu")
         if torch.isnan(logvar).any() or torch.isinf(logvar).any():
             raise ValueError("NaN or Inf detected in logvar")
-        if torch.isnan(heatmap_recon).any() or torch.isinf(heatmap_recon).any():
-            raise ValueError("NaN or Inf detected in heatmap_recon")
+        if torch.isnan(heatmap_norm_recon).any() or torch.isinf(heatmap_norm_recon).any():
+            raise ValueError("NaN or Inf detected in heatmap_norm_recon")
+        if torch.isnan(max_impedance_std_recon).any() or torch.isinf(max_impedance_std_recon).any():
+            raise ValueError("NaN or Inf detected in max_impedance_std_recon")
         if torch.isnan(occupancy_logits).any() or torch.isinf(occupancy_logits).any():
             raise ValueError("NaN or Inf detected in occupancy_logits")
         if torch.isnan(impedance_recon).any() or torch.isinf(impedance_recon).any():
             raise ValueError("NaN or Inf detected in impedance_recon")
         
-        # Compute individual reconstruction losses (raw, before uncertainty weighting)
-        heatmap_loss_raw = self.mae_loss(heatmap_recon, heatmap_target) 
+        # 🔥 STABILITY-FIRST PHYSICAL RECONSTRUCTION LOSS
+        # Re-couple the normalized heatmap with max_impedance to compute physical loss
+        if use_physical_loss:
+            # Unstandardize Z-scores: max_impedance = Z × std + mean
+            max_impedance_recon = max_impedance_std_recon * max_impedance_std + max_impedance_mean
+            max_impedance_target = max_impedance_target_std * max_impedance_std + max_impedance_mean
+            
+            # Reconstruct physical heatmaps: heatmap_physical = heatmap_norm * max_impedance
+            # Broadcasting: (B, 2, 64, 64) * (B, 1, 1, 1) = (B, 2, 64, 64)
+            heatmap_physical_pred = heatmap_norm_recon * max_impedance_recon.view(-1, 1, 1, 1)
+            heatmap_physical_target = heatmap_target_norm * max_impedance_target.view(-1, 1, 1, 1)
+            
+            # Physical reconstruction loss: forces model to learn BOTH shape and scale
+            heatmap_physical_loss_raw = self.mae_loss(heatmap_physical_pred, heatmap_physical_target)
+            
+            # Also compute max_impedance loss separately (on raw values)
+            max_impedance_loss_raw = self.mae_loss(max_impedance_recon, max_impedance_target)
+            
+            # Use physical loss as primary heatmap loss
+            heatmap_loss_raw = heatmap_physical_loss_raw + 0.5 * max_impedance_loss_raw
+        else:
+            # Fallback: use standardized loss (not physically-aware, only for debugging)
+            heatmap_loss_raw = self.mae_loss(heatmap_norm_recon, heatmap_target_norm)
+            max_impedance_loss_raw = self.mae_loss(max_impedance_std_recon, max_impedance_target_std) 
         
         # 🎯 Use enhanced occupancy loss computation
         occupancy_loss_raw = self.compute_occupancy_loss(occupancy_logits, occupancy_target)
@@ -392,6 +445,7 @@ class VAELoss(nn.Module):
         
         # Get current uncertainty values (σ^2 = exp(log_sigma))
         sigma2_heatmap = torch.exp(self.log_sigma_heatmap)
+        sigma2_max_impedance = torch.exp(self.log_sigma_max_impedance)
         sigma2_occupancy = torch.exp(self.log_sigma_occupancy) 
         sigma2_impedance = torch.exp(self.log_sigma_impedance)
         
@@ -438,17 +492,21 @@ class VAELoss(nn.Module):
             'total_loss': total_loss,
             'recon_loss': recon_loss,
             'heatmap_loss': heatmap_loss,
+            'max_impedance_loss': max_impedance_loss_raw if use_physical_loss else torch.tensor(0.0),
             'occupancy_loss': occupancy_loss,
             'impedance_loss': impedance_loss,
             'kl_loss': kl_loss,
             # Additional debugging info for uncertainty-based weighting
             'heatmap_loss_raw': heatmap_loss_raw,
+            'max_impedance_loss_raw': max_impedance_loss_raw,
             'occupancy_loss_raw': occupancy_loss_raw,
             'impedance_loss_raw': impedance_loss_raw,
             'sigma_heatmap': torch.sqrt(sigma2_heatmap),
+            'sigma_max_impedance': torch.sqrt(sigma2_max_impedance),
             'sigma_occupancy': torch.sqrt(sigma2_occupancy),
             'sigma_impedance': torch.sqrt(sigma2_impedance),
             'uncertainty_reg_heatmap': 0.5 * self.log_sigma_heatmap,
+            'uncertainty_reg_max_impedance': 0.5 * self.log_sigma_max_impedance,
             'uncertainty_reg_occupancy': 0.5 * self.log_sigma_occupancy,
             'uncertainty_reg_impedance': 0.5 * self.log_sigma_impedance
         }

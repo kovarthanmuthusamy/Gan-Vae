@@ -243,6 +243,40 @@ class ImpedanceBranch(nn.Module):
         return x
 
 
+class MaxImpedanceBranch(nn.Module):
+    """Max Impedance encoder branch: 1 (scalar) → 8x8x128 (via MLP then reshape)"""
+    
+    def __init__(self):
+        super(MaxImpedanceBranch, self).__init__()
+        
+        # MLP: 1 → 512 → 8192 (= 8*8*128)
+        self.fc1 = nn.Linear(1, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        
+        self.fc2 = nn.Linear(256, 512)
+        self.bn2 = nn.BatchNorm1d(512)
+        
+        self.fc3 = nn.Linear(512, 8 * 8 * 128)  # 8192
+        self.bn3 = nn.BatchNorm1d(8 * 8 * 128)
+        
+        self.apply(_init_weights)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, 1) - scalar max impedance value
+        Returns:
+            features: (batch_size, 128, 8, 8)
+        """
+        x = F.relu(self.bn1(self.fc1(x)))  # (B, 256)
+        x = F.relu(self.bn2(self.fc2(x)))  # (B, 512)
+        x = F.relu(self.bn3(self.fc3(x)))  # (B, 8192)
+        
+        # Reshape to spatial: (B, 8192) → (B, 128, 8, 8)
+        x = x.view(x.size(0), 128, 8, 8)
+        return x
+
+
 class LateFusionEncoder(nn.Module):
     """
     🔥 LATE FUSION ENCODER: Preserves modality signal strength via late fusion
@@ -254,10 +288,11 @@ class LateFusionEncoder(nn.Module):
     4. 🧠 Each modality processed through dedicated Linear layers first
     
     Architecture:
-    - Heatmap: 64x64x2 → CNN → 4x4x64 → flatten → MLP → 256D
+    - Heatmap (Normalized): 64x64x2 → CNN → 4x4x64 → flatten → MLP → 256D
+    - Max Impedance (Scalar): 1 → MLP (deep processing) → 256D
     - Occupancy: 7x8x1 → Stay at native → Linear layers → 256D 
     - Impedance: 231D → MLP (deeper processing) → 256D
-    - Fusion: Concatenate 3*256=768D → Final MLP → latent_dim
+    - Fusion: Concatenate 4*256=1024D → Final MLP → latent_dim
     """
     
     def __init__(self, latent_dim: int = 128):
@@ -294,8 +329,16 @@ class LateFusionEncoder(nn.Module):
         self.imp_fc3 = nn.Linear(256, 256)  # Deep processing  
         self.imp_bn3 = nn.BatchNorm1d(256)
         
-        # 🔗 LATE FUSION: Concatenate 256+256+256=768D → latent 
-        self.fusion_fc1 = nn.Linear(768, 512)  # 3*256 = 768
+        # 🎯 MAX IMPEDANCE: Scalar processing (Late Fusion!)
+        self.max_imp_fc1 = nn.Linear(1, 128)  # Expand scalar
+        self.max_imp_bn1 = nn.BatchNorm1d(128)
+        self.max_imp_fc2 = nn.Linear(128, 256)  # Match other modalities
+        self.max_imp_bn2 = nn.BatchNorm1d(256)
+        self.max_imp_fc3 = nn.Linear(256, 256)  # Deep processing
+        self.max_imp_bn3 = nn.BatchNorm1d(256)
+        
+        # 🔗 LATE FUSION: Concatenate 256+256+256+256=1024D → latent 
+        self.fusion_fc1 = nn.Linear(1024, 512)  # 4*256 = 1024
         self.fusion_bn1 = nn.BatchNorm1d(512)
         self.fusion_fc2 = nn.Linear(512, 256)
         self.fusion_bn2 = nn.BatchNorm1d(256)
@@ -306,11 +349,14 @@ class LateFusionEncoder(nn.Module):
         
         self.apply(_init_weights)
         
-    def forward(self, heatmap: torch.Tensor, occupancy: torch.Tensor, 
-                impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, heatmap: torch.Tensor, max_impedance_std: torch.Tensor,
+                occupancy: torch.Tensor, impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        STABILITY-FIRST forward pass with standardized max_impedance.
+        
         Args:
-            heatmap: (B, 2, 64, 64)
+            heatmap: (B, 2, 64, 64) - NORMALIZED heatmap [0, 1]
+            max_impedance_std: (B, 1) - STANDARDIZED max impedance (Z-score)
             occupancy: (B, 1, 7, 8) 
             impedance: (B, 231)
         Returns:
@@ -335,9 +381,14 @@ class LateFusionEncoder(nn.Module):
         i = F.relu(self.imp_bn1(self.imp_fc1(impedance)))  # (B, 512)
         i = F.relu(self.imp_bn2(self.imp_fc2(i)))           # (B, 256)
         i_features = F.relu(self.imp_bn3(self.imp_fc3(i)))  # (B, 256)
+        
+        # 🎯 MAX IMPEDANCE (STANDARDIZED): Deep MLP processing (Z-score scalar)
+        m = F.relu(self.max_imp_bn1(self.max_imp_fc1(max_impedance_std)))  # (B, 128)
+        m = F.relu(self.max_imp_bn2(self.max_imp_fc2(m)))                   # (B, 256)
+        m_features = F.relu(self.max_imp_bn3(self.max_imp_fc3(m)))          # (B, 256)
          
         # 🔗 LATE FUSION: Concatenate high-level features (preserve signal strength)
-        fused = torch.cat([h_features, o_features, i_features], dim=1)  # (B, 768)
+        fused = torch.cat([h_features, m_features, o_features, i_features], dim=1)  # (B, 1024)
         
         # Final processing
         x = F.relu(self.fusion_bn1(self.fusion_fc1(fused)))  # (B, 512)
@@ -361,9 +412,10 @@ class MidLayerFusionEncoder(nn.Module):
         self.heatmap_branch = HeatmapBranch()
         self.occupancy_branch = OccupancyBranch()
         self.impedance_branch = ImpedanceBranch()
+        self.max_impedance_branch = MaxImpedanceBranch()
         
-        # Fusion: concatenate 3 * 128 = 384 channels → reduce to 128
-        self.fusion_conv = nn.Conv2d(384, 128, kernel_size=1)  # 1x1 conv
+        # Fusion: concatenate 4 * 128 = 512 channels → reduce to 128
+        self.fusion_conv = nn.Conv2d(512, 128, kernel_size=1)  # 1x1 conv
         self.fusion_bn = nn.BatchNorm2d(128)
         
         # Self-Attention at mid-layer (8x8) AFTER fusion to capture cross-modal relationships
@@ -383,11 +435,14 @@ class MidLayerFusionEncoder(nn.Module):
         
         self.apply(_init_weights)
         
-    def forward(self, heatmap: torch.Tensor, occupancy: torch.Tensor, 
-                impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, heatmap: torch.Tensor, max_impedance_std: torch.Tensor,
+                occupancy: torch.Tensor, impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        STABILITY-FIRST forward pass with standardized max_impedance.
+        
         Args:
-            heatmap: (batch_size, 2, 64, 64)
+            heatmap: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1]
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
             occupancy: (batch_size, 1, 7, 8)
             impedance: (batch_size, 231)
         Returns:
@@ -395,12 +450,13 @@ class MidLayerFusionEncoder(nn.Module):
             logvar: (batch_size, latent_dim)
         """
         # Process each modality independently to 8x8x128
-        h_feat = self.heatmap_branch(heatmap)      # (B, 128, 8, 8)
-        o_feat = self.occupancy_branch(occupancy)  # (B, 128, 8, 8)
-        i_feat = self.impedance_branch(impedance)  # (B, 128, 8, 8)
+        h_feat = self.heatmap_branch(heatmap)                      # (B, 128, 8, 8)
+        m_feat = self.max_impedance_branch(max_impedance_std)      # (B, 128, 8, 8)
+        o_feat = self.occupancy_branch(occupancy)                  # (B, 128, 8, 8)
+        i_feat = self.impedance_branch(impedance)                  # (B, 128, 8, 8)
         
-        # Concatenate along channel dimension: 3 * 128 = 384 channels
-        fused = torch.cat([h_feat, o_feat, i_feat], dim=1)  # (B, 384, 8, 8)
+        # Concatenate along channel dimension: 4 * 128 = 512 channels
+        fused = torch.cat([h_feat, m_feat, o_feat, i_feat], dim=1)  # (B, 512, 8, 8)
         
         # Reduce channels with 1x1 conv
         x = F.relu(self.fusion_bn(self.fusion_conv(fused)))  # (B, 128, 8, 8)
@@ -458,18 +514,21 @@ class Encoder(nn.Module):
         if fusion_type == 'late':
             print("  🎯 Benefits: Preserves modality signal strength, better for latent optimization")
         
-    def forward(self, heatmap: torch.Tensor, occupancy: torch.Tensor, 
-                impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, heatmap: torch.Tensor, max_impedance_std: torch.Tensor,
+                occupancy: torch.Tensor, impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        STABILITY-FIRST forward pass with standardized max_impedance.
+        
         Args:
-            heatmap: (batch_size, 2, 64, 64)
+            heatmap: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1]
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
             occupancy: (batch_size, 1, 7, 8)
             impedance: (batch_size, 231)
         Returns:
             mu: (batch_size, latent_dim)
             logvar: (batch_size, latent_dim)
         """
-        return self.fusion_encoder(heatmap, occupancy, impedance)
+        return self.fusion_encoder(heatmap, max_impedance_std, occupancy, impedance)
     
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Reparameterization trick for sampling from latent space"""
@@ -601,7 +660,11 @@ class MasterFeatureGridDecoder(nn.Module):
 
 
 class HeatmapDecoder(nn.Module):
-    """Decoder for 64x64x2 heatmap output from shared master grid"""
+    """Decoder for 64x64x2 heatmap with STABILITY-FIRST Broadcasting Trick
+    
+    Broadcasts STANDARDIZED (Z-score) max_impedance for numerical stability.
+    Outputs NORMALIZED heatmap [0,1] via sigmoid for bounded predictions.
+    """
     
     def __init__(self, grid_channels: int = 128):
         super(HeatmapDecoder, self).__init__()
@@ -612,6 +675,10 @@ class HeatmapDecoder(nn.Module):
         self.heatmap_attn = SelfAttention2D(grid_channels)
         self.heatmap_attn_norm = nn.LayerNorm([grid_channels, 16, 16])
         
+        # Broadcasting fusion: add 1 channel for broadcast max_impedance at 16x16
+        self.broadcast_fusion_16 = nn.Conv2d(grid_channels + 1, grid_channels, kernel_size=1)
+        self.broadcast_bn_16 = nn.BatchNorm2d(grid_channels)
+        
         # Residual conv blocks
         self.residual_conv1 = nn.Conv2d(grid_channels, grid_channels, kernel_size=3, padding=1)
         self.residual_bn1 = nn.BatchNorm2d(grid_channels)
@@ -619,6 +686,10 @@ class HeatmapDecoder(nn.Module):
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
         self.conv1 = nn.Conv2d(grid_channels, 64, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(64)
+        
+        # Broadcasting fusion at 32x32
+        self.broadcast_fusion_32 = nn.Conv2d(64 + 1, 64, kernel_size=1)
+        self.broadcast_bn_32 = nn.BatchNorm2d(64)
         
         # Second residual conv block for 64-channel features
         self.residual_conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
@@ -631,16 +702,25 @@ class HeatmapDecoder(nn.Module):
         
         self.apply(_init_weights)
         
-    def forward(self, master_grid: torch.Tensor) -> torch.Tensor:
+    def forward(self, master_grid: torch.Tensor, max_impedance_std: torch.Tensor) -> torch.Tensor:
         """
         Args:
             master_grid: (batch_size, grid_channels, 16, 16)
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
         Returns:
-            heatmap: (batch_size, 2, 64, 64)
+            heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1]
         """
+        B = master_grid.size(0)
+        
         # Start from shared 16x16 grid with attention and residual connections
         attn_out = self.heatmap_attn(master_grid)  # (B, grid_channels, 16, 16)
         x = self.heatmap_attn_norm(attn_out)  # Layer norm after attention
+        
+        # 📡 STABILITY-FIRST BROADCASTING at 16x16: Inject STANDARDIZED max_impedance
+        # Broadcast Z-score (mean~0, std~1) to 16x16 spatial grid for stability
+        max_imp_broadcast = max_impedance_std.view(B, 1, 1, 1).expand(B, 1, 16, 16)  # (B, 1, 16, 16)
+        x_with_max = torch.cat([x, max_imp_broadcast], dim=1)  # (B, grid_channels+1, 16, 16)
+        x = F.relu(self.broadcast_bn_16(self.broadcast_fusion_16(x_with_max)))  # (B, grid_channels, 16, 16)
         
         # First residual block at 16x16
         residual = x
@@ -651,6 +731,11 @@ class HeatmapDecoder(nn.Module):
         x = F.relu(self.bn1(self.conv1(x)))  # (B, 64, 16, 16)
         x = self.upsample(x)  # 32x32
         
+        # 📡 STABILITY-FIRST BROADCASTING at 32x32: Inject STANDARDIZED max_impedance again
+        max_imp_broadcast_32 = max_impedance_std.view(B, 1, 1, 1).expand(B, 1, 32, 32)  # (B, 1, 32, 32)
+        x_with_max_32 = torch.cat([x, max_imp_broadcast_32], dim=1)  # (B, 65, 32, 32)
+        x = F.relu(self.broadcast_bn_32(self.broadcast_fusion_32(x_with_max_32)))  # (B, 64, 32, 32)
+        
         # Second residual block at 32x32 for 64-channel features
         residual = x  
         x = F.relu(self.residual_bn2(self.residual_conv2(x)))
@@ -658,21 +743,27 @@ class HeatmapDecoder(nn.Module):
         
         x = F.relu(self.bn2(self.conv2(x)))  # (B, 32, 32, 32)
         x = self.upsample(x)  # 64x64
-        x = torch.tanh(self.conv3(x))  # (B, 2, 64, 64)
+        
+        # ⚡ STABILITY-FIRST: Output normalized heatmap with SIGMOID for bounded [0, 1]
+        x = torch.sigmoid(self.conv3(x))  # (B, 2, 64, 64) - Guaranteed [0, 1]
         
         return x
     
-    def forward_with_dropout(self, master_grid: torch.Tensor, dropout_prob: float = 0.05) -> torch.Tensor:
+    def forward_with_dropout(self, master_grid: torch.Tensor, max_impedance_std: torch.Tensor, 
+                             dropout_prob: float = 0.05) -> torch.Tensor:
         """
         Forward pass with feature dropout applied at intermediate layers.
         Weakens decoder by randomly zeroing intermediate feature representations.
         
         Args:
             master_grid: (batch_size, grid_channels, 16, 16)
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
             dropout_prob: Probability of zeroing intermediate features
         Returns:
-            heatmap: (batch_size, 2, 64, 64)
+            heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap
         """
+        B = master_grid.size(0)
+        
         # Start from shared 16x16 grid with attention and residual connections
         attn_out = self.heatmap_attn(master_grid)  # (B, grid_channels, 16, 16)
         x = self.heatmap_attn_norm(attn_out)  # Layer norm after attention
@@ -680,6 +771,11 @@ class HeatmapDecoder(nn.Module):
         # Apply dropout after attention during training
         if self.training and dropout_prob > 0:
             x = F.dropout2d(x, p=dropout_prob, training=True, inplace=False)
+        
+        # 📡 STABILITY-FIRST BROADCASTING at 16x16: Inject STANDARDIZED max_impedance
+        max_imp_broadcast = max_impedance_std.view(B, 1, 1, 1).expand(B, 1, 16, 16)  # (B, 1, 16, 16)
+        x_with_max = torch.cat([x, max_imp_broadcast], dim=1)  # (B, grid_channels+1, 16, 16)
+        x = F.relu(self.broadcast_bn_16(self.broadcast_fusion_16(x_with_max)))  # (B, grid_channels, 16, 16)
         
         # First residual block at 16x16
         residual = x
@@ -694,6 +790,11 @@ class HeatmapDecoder(nn.Module):
         if self.training and dropout_prob > 0:
             x = F.dropout2d(x, p=dropout_prob * 0.5, training=True, inplace=False)  # Reduced dropout deeper in network
         
+        # 📡 STABILITY-FIRST BROADCASTING at 32x32: Inject STANDARDIZED max_impedance again
+        max_imp_broadcast_32 = max_impedance_std.view(B, 1, 1, 1).expand(B, 1, 32, 32)  # (B, 1, 32, 32)
+        x_with_max_32 = torch.cat([x, max_imp_broadcast_32], dim=1)  # (B, 65, 32, 32)
+        x = F.relu(self.broadcast_bn_32(self.broadcast_fusion_32(x_with_max_32)))  # (B, 64, 32, 32)
+        
         # Second residual block at 32x32 for 64-channel features
         residual = x  
         x = F.relu(self.residual_bn2(self.residual_conv2(x)))
@@ -701,7 +802,9 @@ class HeatmapDecoder(nn.Module):
         
         x = F.relu(self.bn2(self.conv2(x)))  # (B, 32, 32, 32)
         x = self.upsample(x)  # 64x64
-        x = torch.tanh(self.conv3(x))  # (B, 2, 64, 64)
+        
+        # ⚡ STABILITY-FIRST: Output normalized heatmap with SIGMOID for bounded [0, 1]
+        x = torch.sigmoid(self.conv3(x))  # (B, 2, 64, 64) - Guaranteed [0, 1]
         
         return x
 
@@ -868,8 +971,86 @@ class ImpedanceDecoder(nn.Module):
         return x
 
 
+class MaxImpedanceDecoder(nn.Module):
+    """Decoder for max impedance scalar with STABILITY-FIRST design
+    
+    Predicts STANDARDIZED (Z-score) max impedance for stable training.
+    The standardized value is used for broadcasting, then unstandardized for physical loss.
+    """
+    
+    def __init__(self, latent_dim: int = 128):
+        super(MaxImpedanceDecoder, self).__init__()
+        self.latent_dim = latent_dim
+        
+        # Scalar head: latent → standardized max_impedance (Z-score)
+        self.fc1 = nn.Linear(latent_dim, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        
+        # Residual MLP block
+        self.residual_fc = nn.Linear(128, 128)
+        self.residual_bn = nn.BatchNorm1d(128)
+        
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        
+        self.fc3 = nn.Linear(64, 1)  # Predict STANDARDIZED scalar (unbounded)
+        
+        self.apply(_init_weights)
+        
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            z: (batch_size, latent_dim)
+        Returns:
+            max_impedance_std: (batch_size, 1) - predicted STANDARDIZED max impedance (Z-score)
+        """
+        x = F.relu(self.bn1(self.fc1(z)))
+        
+        # Residual MLP block
+        residual = x
+        x = F.relu(self.residual_bn(self.residual_fc(x)))
+        x = x + residual  # Skip connection
+        
+        x = F.relu(self.bn2(self.fc2(x)))
+        max_imp_std = self.fc3(x)  # Unbounded output (Z-score can be negative)
+        return max_imp_std
+    
+    def forward_with_dropout(self, z: torch.Tensor, dropout_prob: float = 0.05) -> torch.Tensor:
+        """
+        Forward pass with feature dropout applied to intermediate MLP layers.
+        
+        Args:
+            z: (batch_size, latent_dim)
+            dropout_prob: Probability of zeroing intermediate features
+        Returns:
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance
+        """
+        x = F.relu(self.bn1(self.fc1(z)))
+        
+        # Apply dropout after first layer during training
+        if self.training and dropout_prob > 0:
+            x = F.dropout(x, p=dropout_prob, training=True, inplace=False)
+        
+        # Residual MLP block
+        residual = x
+        x = F.relu(self.residual_bn(self.residual_fc(x)))
+        x = x + residual  # Skip connection
+        
+        # Apply dropout after residual block during training
+        if self.training and dropout_prob > 0:
+            x = F.dropout(x, p=dropout_prob * 0.5, training=True, inplace=False)  # Reduced dropout
+        
+        x = F.relu(self.bn2(self.fc2(x)))
+        max_imp_std = self.fc3(x)  # Unbounded output (Z-score)
+        return max_imp_std
+
+
 class Decoder(nn.Module):
-    """Hierarchical decoder with shared master feature grid for spatial alignment"""
+    """Hierarchical decoder with STABILITY-FIRST design
+    
+    Uses Z-score normalization for max_impedance predictions and broadcasting.
+    Requires external standardization parameters (mean, std) for unstandardization.
+    """
     
     def __init__(self, latent_dim: int = 128, grid_channels: int = 128):
         super(Decoder, self).__init__()
@@ -883,40 +1064,46 @@ class Decoder(nn.Module):
         self.heatmap_dec = HeatmapDecoder(grid_channels)
         self.occupancy_dec = OccupancyDecoder(grid_channels)
         
-        # Impedance remains independent (non-spatial)
+        # Independent scalar and vector decoders
+        self.max_impedance_dec = MaxImpedanceDecoder(latent_dim)
         self.impedance_dec = ImpedanceDecoder(latent_dim)
     
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Hierarchical decoding: latent → shared master grid → spatial branches
+        Hierarchical decoding with STABILITY-FIRST design.
         
         Args:
             z: (batch_size, latent_dim)
         Returns:
-            heatmap: (batch_size, 2, 64, 64)
+            heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1] (sigmoid-bounded)
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
             occupancy_logits: (batch_size, 1, 7, 8)
             impedance: (batch_size, 231)
         """
-        # Step 1: Create shared master feature grid (16x16x128)
+        # Step 1: Predict STANDARDIZED max impedance (Branch A - Scalar Head)
+        max_impedance_std = self.max_impedance_dec(z)  # (B, 1) - Z-score
+        
+        # Step 2: Create shared master feature grid (16x16x128)
         master_grid = self.master_grid_dec(z)  # (B, grid_channels, 16, 16)
         
-        # Step 2: Spatial branches start from shared understanding
-        heatmap = self.heatmap_dec(master_grid)
+        # Step 3: Spatial branches with STANDARDIZED broadcasting
+        # Heatmap decoder uses Z-score for conditioning, outputs sigmoid-bounded [0, 1]
+        heatmap_norm = self.heatmap_dec(master_grid, max_impedance_std)  # (B, 2, 64, 64)
         occupancy = self.occupancy_dec(master_grid)
         
-        # Step 3: Impedance remains independent (non-spatial)
+        # Step 4: Impedance remains independent (non-spatial)
         impedance = self.impedance_dec(z)
         
-        return heatmap, occupancy, impedance
+        return heatmap_norm, max_impedance_std, occupancy, impedance
     
     def forward_with_dropout(
         self, 
         z: torch.Tensor, 
         master_grid_dropout_prob: float = 0.10,
         feature_dropout_prob: float = 0.05
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Hierarchical decoding with dropout for decoder weakening
+        Hierarchical decoding with dropout (STABILITY-FIRST design).
         
         Args:
             z: (batch_size, latent_dim)
@@ -924,69 +1111,101 @@ class Decoder(nn.Module):
             feature_dropout_prob: Dropout probability for decoder intermediate features
         
         Returns:
-            heatmap: (batch_size, 2, 64, 64)
+            heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1]
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
             occupancy_logits: (batch_size, 1, 7, 8)
             impedance: (batch_size, 231)
         """
-        # Step 1: Create shared master feature grid with dropout
+        # Step 1: Predict STANDARDIZED max impedance with dropout
+        max_impedance_std = self.max_impedance_dec.forward_with_dropout(z, dropout_prob=feature_dropout_prob)
+        
+        # Step 2: Create shared master feature grid with dropout
         master_grid = self.master_grid_dec.forward_with_dropout(
             z, dropout_prob=master_grid_dropout_prob
         )
         
-        # Step 2: Spatial branches start from shared understanding with feature dropout
-        heatmap = self.heatmap_dec.forward_with_dropout(master_grid, dropout_prob=feature_dropout_prob)
+        # Step 3: Spatial branches with STANDARDIZED broadcasting and dropout
+        heatmap_norm = self.heatmap_dec.forward_with_dropout(
+            master_grid, max_impedance_std, dropout_prob=feature_dropout_prob
+        )
         occupancy = self.occupancy_dec.forward_with_dropout(master_grid, dropout_prob=feature_dropout_prob)
         
-        # Step 3: Impedance remains independent with feature dropout
+        # Step 4: Impedance remains independent with feature dropout
         impedance = self.impedance_dec.forward_with_dropout(z, dropout_prob=feature_dropout_prob)
         
-        return heatmap, occupancy, impedance
+        return heatmap_norm, max_impedance_std, occupancy, impedance
 
 
 class MultiInputVAE(nn.Module):
     """
-    Variational Autoencoder with three inputs and three outputs
+    Variational Autoencoder with STABILITY-FIRST physically-aware design.
+    
+    Key Features:
+    - Uses Z-score normalization for max_impedance (mean=0, std=1)
+    - Broadcasts standardized values for numerical stability
+    - Sigmoid-bounded heatmap outputs [0, 1]
+    - Physical reconstruction via unstandardization in loss function
     
     Inputs:
-        - heatmap: (batch_size, 2, 64, 64)
+        - heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1]
+        - max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
         - occupancy: (batch_size, 1, 7, 8)
         - impedance: (batch_size, 231)
     
     Outputs:
-        - reconstructed_heatmap: (batch_size, 2, 64, 64)
+        - reconstructed_heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED [0, 1]
+        - reconstructed_max_impedance_std: (batch_size, 1) - STANDARDIZED (Z-score)
         - reconstructed_occupancy: (batch_size, 1, 7, 8)
         - reconstructed_impedance: (batch_size, 231)
     """
     
-    def __init__(self, latent_dim: int = 128):
+    def __init__(self, latent_dim: int = 128, max_imp_mean: float = 0.0, max_imp_std: float = 1.0):
         super(MultiInputVAE, self).__init__()
         self.latent_dim = latent_dim
         
+        # Register standardization parameters as buffers (saved with model but not trained)
+        self.register_buffer('max_imp_mean', torch.tensor(max_imp_mean, dtype=torch.float32))
+        self.register_buffer('max_imp_std', torch.tensor(max_imp_std, dtype=torch.float32))
+        
         self.encoder = Encoder(latent_dim, fusion_type='late')  # 🔥 Use late fusion by default
         self.decoder = Decoder(latent_dim)
+    
+    def set_standardization_params(self, mean: float, std: float):
+        """Update standardization parameters (call after computing stats from dataset)"""
+        self.max_imp_mean = torch.tensor(mean, dtype=torch.float32, device=self.max_imp_mean.device)
+        self.max_imp_std = torch.tensor(std, dtype=torch.float32, device=self.max_imp_std.device)
+    
+    def standardize_max_impedance(self, max_impedance: torch.Tensor) -> torch.Tensor:
+        """Convert raw max_impedance to Z-score"""
+        return (max_impedance - self.max_imp_mean) / self.max_imp_std
+    
+    def unstandardize_max_impedance(self, max_impedance_std: torch.Tensor) -> torch.Tensor:
+        """Convert Z-score back to raw max_impedance"""
+        return max_impedance_std * self.max_imp_std + self.max_imp_mean
         
-    def encode(self, heatmap: torch.Tensor, occupancy: torch.Tensor,
-               impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode inputs to latent space"""
-        mu, logvar = self.encoder(heatmap, occupancy, impedance)
+    def encode(self, heatmap_norm: torch.Tensor, max_impedance_std: torch.Tensor,
+               occupancy: torch.Tensor, impedance: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode inputs to latent space (expects STANDARDIZED max_impedance)"""
+        mu, logvar = self.encoder(heatmap_norm, max_impedance_std, occupancy, impedance)
         return mu, logvar
     
-    def decode(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Decode from latent space"""
-        heatmap, occupancy, impedance = self.decoder(z)
-        return heatmap, occupancy, impedance
+    def decode(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode from latent space (returns STANDARDIZED max_impedance)"""
+        heatmap_norm, max_impedance_std, occupancy, impedance = self.decoder(z)
+        return heatmap_norm, max_impedance_std, occupancy, impedance
     
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Reparameterization trick"""
         return self.encoder.reparameterize(mu, logvar)
     
-    def forward(self, heatmap: torch.Tensor, occupancy: torch.Tensor,
-                impedance: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, heatmap_norm: torch.Tensor, max_impedance_std: torch.Tensor,
+                occupancy: torch.Tensor, impedance: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Forward pass through VAE
+        Forward pass with STABILITY-FIRST design.
         
         Args:
-            heatmap: (batch_size, 2, 64, 64)
+            heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1]
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
             occupancy: (batch_size, 1, 7, 8)
             impedance: (batch_size, 231)
         
@@ -995,25 +1214,27 @@ class MultiInputVAE(nn.Module):
                 - mu: latent mean
                 - logvar: latent log variance
                 - z: sampled latent vector
-                - heatmap_recon: reconstructed heatmap
+                - heatmap_recon: reconstructed NORMALIZED heatmap [0, 1]
+                - max_impedance_recon: reconstructed STANDARDIZED max impedance (Z-score)
                 - occupancy_recon: reconstructed occupancy
                 - impedance_recon: reconstructed impedance
         """
-        # Encode
-        mu, logvar = self.encoder(heatmap, occupancy, impedance)
+        # Encode (expects standardized input)
+        mu, logvar = self.encoder(heatmap_norm, max_impedance_std, occupancy, impedance)
         
         # Sample from latent space
         z = self.reparameterize(mu, logvar)
         
-        # Decode
-        heatmap_recon, occupancy_logits, impedance_recon = self.decoder(z)
+        # Decode (returns standardized output)
+        heatmap_norm_recon, max_impedance_std_recon, occupancy_logits, impedance_recon = self.decoder(z)
         occupancy_recon = torch.sigmoid(occupancy_logits)
         
         return {
             'mu': mu,
             'logvar': logvar,
             'z': z,
-            'heatmap_recon': heatmap_recon,
+            'heatmap_recon': heatmap_norm_recon,  # Normalized heatmap [0, 1]
+            'max_impedance_recon': max_impedance_std_recon,  # STANDARDIZED (Z-score)
             'occupancy_recon': occupancy_recon,
             'occupancy_logits': occupancy_logits,
             'impedance_recon': impedance_recon
@@ -1021,7 +1242,8 @@ class MultiInputVAE(nn.Module):
     
     def forward_with_decoder_dropout(
         self, 
-        heatmap: torch.Tensor, 
+        heatmap_norm: torch.Tensor,
+        max_impedance_std: torch.Tensor,
         occupancy: torch.Tensor,
         impedance: torch.Tensor,
         latent_dropout_prob: float = 0.15,
@@ -1029,7 +1251,7 @@ class MultiInputVAE(nn.Module):
         feature_dropout_prob: float = 0.05
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass with decoder weakening via dropout.
+        STABILITY-FIRST forward pass with decoder weakening via dropout.
         
         This method implements several techniques to weaken the decoder and force it to rely
         more heavily on the latent vector rather than its own internal representations:
@@ -1039,7 +1261,8 @@ class MultiInputVAE(nn.Module):
         3. Feature Dropout: Adds dropout to intermediate decoder layers
         
         Args:
-            heatmap: (batch_size, 2, 64, 64) 
+            heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1]
+            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
             occupancy: (batch_size, 1, 7, 8)
             impedance: (batch_size, 231)
             latent_dropout_prob: Probability of zeroing latent dimensions
@@ -1050,7 +1273,7 @@ class MultiInputVAE(nn.Module):
             Dictionary containing reconstructed outputs and latent variables
         """
         # Encode normally
-        mu, logvar = self.encoder(heatmap, occupancy, impedance)
+        mu, logvar = self.encoder(heatmap_norm, max_impedance_std, occupancy, impedance)
         
         # Sample from latent space
         z = self.reparameterize(mu, logvar)
@@ -1061,7 +1284,7 @@ class MultiInputVAE(nn.Module):
             z = z * latent_mask
         
         # Decode with dropout-enabled decoder
-        heatmap_recon, occupancy_logits, impedance_recon = self.decoder.forward_with_dropout(
+        heatmap_norm_recon, max_impedance_recon, occupancy_logits, impedance_recon = self.decoder.forward_with_dropout(
             z, 
             master_grid_dropout_prob=master_grid_dropout_prob,
             feature_dropout_prob=feature_dropout_prob
@@ -1072,7 +1295,8 @@ class MultiInputVAE(nn.Module):
             'mu': mu,
             'logvar': logvar,
             'z': z,
-            'heatmap_recon': heatmap_recon,
+            'heatmap_recon': heatmap_norm_recon,
+            'max_impedance_recon': max_impedance_recon,  # STANDARDIZED (Z-score)
             'occupancy_recon': occupancy_recon,
             'occupancy_logits': occupancy_logits,
             'impedance_recon': impedance_recon

@@ -15,7 +15,7 @@ if str(SOURCE_DIR) not in sys.path:
 from model.vae_multi_input import MultiInputVAE
 from loss.vae_loss import VAELoss
 from others.vae_logger import VAETrainingLogger
-from others.dataloader import create_data_loaders, VAEDataset
+from others.dataloader import create_data_loaders, VAEDataset, compute_max_impedance_statistics
 from others.model_to_config import model_to_config_generic
 
 try:
@@ -121,7 +121,7 @@ class TrainingConfig:
         return exp_path, log_path, checkpoint_path
 
 
-LOSS_KEYS = ("total_loss", "recon_loss", "heatmap_loss", "occupancy_loss", "impedance_loss", "kl_loss")
+LOSS_KEYS = ("total_loss", "recon_loss", "heatmap_loss", "max_impedance_loss", "occupancy_loss", "impedance_loss", "kl_loss")
 
 
 def init_loss_dict() -> Dict[str, float]:
@@ -138,7 +138,8 @@ def average_losses(loss_dict: Dict[str, float], denom: int) -> None:
 class VAETrainer:
     def __init__(self, model: MultiInputVAE, loss_fn: VAELoss, lr: float = 1e-5,
                  device: Optional[torch.device] = None, logger: Optional[VAETrainingLogger] = None,
-                 attn_lr_multiplier: float = 4.0, attn_lr_max_multiplier: float = 6.0):
+                 attn_lr_multiplier: float = 4.0, attn_lr_max_multiplier: float = 6.0,
+                 max_impedance_mean: float = 0.0, max_impedance_std: float = 1.0):
         self.model = model
         self.loss_fn = loss_fn
         self.logger = logger
@@ -146,6 +147,8 @@ class VAETrainer:
         self.attn_group_idx: Optional[int] = None
         self.attn_lr_base = lr * attn_lr_multiplier
         self.attn_lr_max = lr * attn_lr_max_multiplier
+        self.max_impedance_mean = max_impedance_mean
+        self.max_impedance_std = max_impedance_std
 
         base_params = []
         attn_params = []
@@ -173,20 +176,30 @@ class VAETrainer:
         self.optimizer = optim.Adam(param_groups)
         self.model.to(self.device)
         self.loss_fn.to(self.device)
+        
+        # Set standardization parameters in model
+        self.model.set_standardization_params(max_impedance_mean, max_impedance_std)
     
-    def train_step(self, heatmap: torch.Tensor, occupancy: torch.Tensor, 
-                   impedance: torch.Tensor, beta: float = 1.0, 
+    def train_step(self, heatmap: torch.Tensor, max_impedance_std: torch.Tensor,
+                   occupancy: torch.Tensor, impedance: torch.Tensor, beta: float = 1.0,
                    decoder_dropout_config: Optional[Dict[str, float]] = None) -> Dict[str, float]:
         self.model.train()
         self.optimizer.zero_grad()
         
         # Apply decoder weakening during training
         if decoder_dropout_config is not None:
-            outputs = self.model.forward_with_decoder_dropout(heatmap, occupancy, impedance, **decoder_dropout_config)
+            outputs = self.model.forward_with_decoder_dropout(
+                heatmap, max_impedance_std, occupancy, impedance, **decoder_dropout_config)
         else:
-            outputs = self.model(heatmap, occupancy, impedance)
+            outputs = self.model(heatmap, max_impedance_std, occupancy, impedance)
             
-        loss_dict = self.loss_fn(outputs, heatmap, occupancy, impedance, kl_weight_multiplier=beta)
+        loss_dict = self.loss_fn(
+            outputs, heatmap, max_impedance_std, occupancy, impedance,
+            max_impedance_mean=self.max_impedance_mean,
+            max_impedance_std=self.max_impedance_std,
+            kl_weight_multiplier=beta,
+            use_physical_loss=True
+        )
         loss_dict['total_loss'].backward()
         # Gradient clipping for both model and loss function parameters
         all_params = list(self.model.parameters()) + list(self.loss_fn.parameters())
@@ -195,19 +208,27 @@ class VAETrainer:
         
         return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
     
-    def eval_step(self, heatmap: torch.Tensor, occupancy: torch.Tensor,
-                  impedance: torch.Tensor, beta: float = 1.0) -> Dict[str, float]:
+    def eval_step(self, heatmap: torch.Tensor, max_impedance_std: torch.Tensor,
+                  occupancy: torch.Tensor, impedance: torch.Tensor, beta: float = 1.0) -> Dict[str, float]:
         self.model.eval()
         with torch.no_grad():
-            outputs = self.model(heatmap, occupancy, impedance)
-            loss_dict = self.loss_fn(outputs, heatmap, occupancy, impedance, kl_weight_multiplier=beta)
+            outputs = self.model(heatmap, max_impedance_std, occupancy, impedance)
+            loss_dict = self.loss_fn(
+                outputs, heatmap, max_impedance_std, occupancy, impedance,
+                max_impedance_mean=self.max_impedance_mean,
+                max_impedance_std=self.max_impedance_std,
+                kl_weight_multiplier=beta,
+                use_physical_loss=True
+            )
         return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
     
     def save_checkpoint(self, path: str, epoch: Optional[int] = None):
         checkpoint: Dict[str, Any] = {
             'model_state_dict': self.model.state_dict(), 
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'loss_fn_state_dict': self.loss_fn.state_dict()  # Save uncertainty parameters
+            'loss_fn_state_dict': self.loss_fn.state_dict(),  # Save uncertainty parameters
+            'max_impedance_mean': self.max_impedance_mean,  # Save standardization params
+            'max_impedance_std': self.max_impedance_std      # Save standardization params
         }
         if epoch is not None:
             checkpoint['epoch'] = epoch
@@ -317,6 +338,16 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
     logger.info(f"    - Initial σ occupancy: {torch.exp(torch.tensor(cfg.init_log_sigma_occupancy)):.3f}")
     logger.info(f"    - Initial σ impedance: {torch.exp(torch.tensor(cfg.init_log_sigma_impedance)):.3f}")
     
+    # 🎯 STEP 1: Compute max_impedance statistics for Z-score standardization
+    logger.info(f"\n{'='*80}")
+    logger.info("STEP 1: Computing max_impedance statistics for Z-score standardization")
+    logger.info(f"{'='*80}")
+    max_impedance_mean, max_impedance_std_val = compute_max_impedance_statistics(
+        data_dir=cfg.data_dir,
+        num_samples=1000  # Sample 1000 for statistics
+    )
+    logger.info(f"✅ Z-score parameters: mean={max_impedance_mean:.6f}, std={max_impedance_std_val:.6f}")
+    
     model = MultiInputVAE(latent_dim=cfg.latent_dim)
     loss_fn = VAELoss(
         init_log_sigma_heatmap=cfg.init_log_sigma_heatmap,
@@ -344,6 +375,8 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
         logger=logger,
         attn_lr_multiplier=cfg.attn_lr_multiplier,
         attn_lr_max_multiplier=cfg.attn_lr_max_multiplier,
+        max_impedance_mean=max_impedance_mean,
+        max_impedance_std=max_impedance_std_val,
     )
 
     # Handle checkpoint resumption
@@ -399,6 +432,8 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
         normalize=cfg.normalize,
         train_split=cfg.train_split,
         seed=cfg.seed,
+        max_impedance_mean=max_impedance_mean,
+        max_impedance_std=max_impedance_std_val,
     )
 
     train_batches = len(train_loader)
@@ -417,7 +452,8 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
         epoch_losses = init_loss_dict()
 
         for batch_idx, batch in enumerate(train_loader):
-            heatmap = ensure_channel_first(batch['heatmap'], expected_channels=2).to(device)
+            heatmap = ensure_channel_first(batch['heatmap_norm'], expected_channels=2).to(device)
+            max_impedance_std = batch['max_impedance_std'].to(device)
             occupancy = ensure_channel_first(batch['occupancy'], expected_channels=1).to(device)
             impedance = batch['impedance'].to(device)
 
@@ -437,7 +473,7 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
                     'feature_dropout_prob': cfg.feature_dropout_prob
                 }
 
-            batch_losses = trainer.train_step(heatmap, occupancy, impedance, beta=beta, 
+            batch_losses = trainer.train_step(heatmap, max_impedance_std, occupancy, impedance, beta=beta, 
                                              decoder_dropout_config=decoder_dropout_config)
             for key in epoch_losses:
                 epoch_losses[key] += batch_losses[key]
@@ -446,11 +482,12 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
 
         val_losses = init_loss_dict()
         for batch in val_loader:
-            heatmap = ensure_channel_first(batch['heatmap'], expected_channels=2).to(device)
+            heatmap = ensure_channel_first(batch['heatmap_norm'], expected_channels=2).to(device)
+            max_impedance_std = batch['max_impedance_std'].to(device)
             occupancy = ensure_channel_first(batch['occupancy'], expected_channels=1).to(device)
             impedance = batch['impedance'].to(device)
 
-            val_batch_losses = trainer.eval_step(heatmap, occupancy, impedance, beta=beta)
+            val_batch_losses = trainer.eval_step(heatmap, max_impedance_std, occupancy, impedance, beta=beta)
             for key in val_losses:
                 val_losses[key] += val_batch_losses[key]
 
@@ -475,6 +512,7 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
             epoch_losses['recon_loss'],
             epoch_losses['kl_loss'],
             epoch_losses['heatmap_loss'],
+            epoch_losses['max_impedance_loss'],
             epoch_losses['occupancy_loss'],
             epoch_losses['impedance_loss'],
         )
@@ -497,12 +535,13 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
             with torch.no_grad():
                 # Sample a batch for diagnostics
                 sample_batch = next(iter(train_loader))
-                heatmap_sample = ensure_channel_first(sample_batch['heatmap'], expected_channels=2).to(device)
+                heatmap_sample = ensure_channel_first(sample_batch['heatmap_norm'], expected_channels=2).to(device)
+                max_impedance_std_sample = sample_batch['max_impedance_std'].to(device)
                 occupancy_sample = ensure_channel_first(sample_batch['occupancy'], expected_channels=1).to(device)  
                 impedance_sample = sample_batch['impedance'].to(device)
                 
                 # Latent space diagnostics
-                mu, logvar = trainer.model.encode(heatmap_sample, occupancy_sample, impedance_sample)
+                mu, logvar = trainer.model.encoder(heatmap_sample, max_impedance_std_sample, occupancy_sample, impedance_sample)
                 mu_mean = mu.mean().item()
                 mu_std = mu.std().item()
                 logvar_mean = logvar.mean().item()

@@ -42,6 +42,7 @@ class VAETrainingLogger:
         self.recon_loss = []
         self.kl_loss = []
         self.heatmap_loss = []
+        self.max_impedance_loss = []
         self.occupancy_loss = []
         self.impedance_loss = []
         
@@ -49,7 +50,7 @@ class VAETrainingLogger:
         with open(self.csv_path, 'w', newline='') as f:
             csv.writer(f).writerow([
                 'epoch', 'total_loss', 'recon_loss', 'kl_loss',
-                'heatmap_loss', 'occupancy_loss', 'impedance_loss'
+                'heatmap_loss', 'max_impedance_loss', 'occupancy_loss', 'impedance_loss'
             ])
     
     def log(self, epoch: int,
@@ -57,6 +58,7 @@ class VAETrainingLogger:
             recon_loss: float,
             kl_loss: float,
             heatmap_loss: float,
+            max_impedance_loss: float,
             occupancy_loss: float,
             impedance_loss: float):
         """
@@ -68,6 +70,7 @@ class VAETrainingLogger:
             recon_loss: Reconstruction loss (weighted sum)
             kl_loss: KL divergence loss
             heatmap_loss: Heatmap reconstruction loss
+            max_impedance_loss: Max impedance reconstruction loss (raw)
             occupancy_loss: Occupancy reconstruction loss
             impedance_loss: Impedance reconstruction loss
         """
@@ -76,6 +79,7 @@ class VAETrainingLogger:
         self.recon_loss.append(recon_loss)
         self.kl_loss.append(kl_loss)
         self.heatmap_loss.append(heatmap_loss)
+        self.max_impedance_loss.append(max_impedance_loss)
         self.occupancy_loss.append(occupancy_loss)
         self.impedance_loss.append(impedance_loss)
         
@@ -83,12 +87,12 @@ class VAETrainingLogger:
         with open(self.csv_path, 'a', newline='') as f:
             csv.writer(f).writerow([
                 epoch, total_loss, recon_loss, kl_loss,
-                heatmap_loss, occupancy_loss, impedance_loss
+                heatmap_loss, max_impedance_loss, occupancy_loss, impedance_loss
             ])
         
         # Console output
         print(f"Ep {epoch:3d} | Total: {total_loss:8.4f} | Recon: {recon_loss:8.4f} | KL: {kl_loss:8.4f} | "
-              f"HM: {heatmap_loss:8.4f} | OC: {occupancy_loss:8.4f} | IMP: {impedance_loss:8.4f}")
+              f"HM: {heatmap_loss:8.4f} | MaxImp: {max_impedance_loss:7.4f} | OC: {occupancy_loss:8.4f} | IMP: {impedance_loss:8.4f}")
     
     def log_dict(self, epoch: int, loss_dict: dict):
         """
@@ -104,6 +108,7 @@ class VAETrainingLogger:
             recon_loss=loss_dict['recon_loss'],
             kl_loss=loss_dict['kl_loss'],
             heatmap_loss=loss_dict['heatmap_loss'],
+            max_impedance_loss=loss_dict.get('max_impedance_loss', loss_dict.get('max_impedance_loss_raw', 0.0)),
             occupancy_loss=loss_dict['occupancy_loss'],
             impedance_loss=loss_dict['impedance_loss']
         )
@@ -195,6 +200,7 @@ class VAETrainingLogger:
         recon_loss = np.array(self.recon_loss)
         kl_loss = np.array(self.kl_loss)
         heatmap_loss = np.array(self.heatmap_loss)
+        max_impedance_loss = np.array(self.max_impedance_loss)
         occupancy_loss = np.array(self.occupancy_loss)
         impedance_loss = np.array(self.impedance_loss)
         
@@ -213,6 +219,7 @@ class VAETrainingLogger:
         
         # Reconstruction loss components
         axes[0, 1].plot(epochs, heatmap_loss, 'orange', label='Heatmap Loss', linewidth=2)
+        axes[0, 1].plot(epochs, max_impedance_loss, 'red', label='Max Impedance Loss', linewidth=1.5)
         axes[0, 1].plot(epochs, occupancy_loss, 'purple', label='Occupancy Loss', linewidth=2)
         axes[0, 1].plot(epochs, impedance_loss, 'brown', label='Impedance Loss', linewidth=2)
         axes[0, 1].set_xlabel('Epoch')

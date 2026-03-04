@@ -2,9 +2,6 @@ import pandas as pd
 import numpy as np
 import os
 from pathlib import Path
-import re
-import argparse
-import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache
 
@@ -22,7 +19,7 @@ FRAME_PATH = SCRIPT_DIR.parent / "configs" / "binary_mask.npy"
 # OUTPUT CONFIGURATION
 # Specify where to save the processed dataset
 # ============================================================
-TRAIN_DATA_ROOT = SCRIPT_DIR.parent / "source" / "data_2"
+TRAIN_DATA_ROOT = SCRIPT_DIR.parent / "datasets" / "data"
 OUTPUT_HEATMAP_DIR = TRAIN_DATA_ROOT / "heatmap"
 OUTPUT_IMPEDANCE_DIR = TRAIN_DATA_ROOT / "Imp"
 OUTPUT_OCCUPANCY_DIR = TRAIN_DATA_ROOT / "Occ_map"
@@ -31,20 +28,19 @@ OUTPUT_OCCUPANCY_DIR = TRAIN_DATA_ROOT / "Occ_map"
 # INPUT/SOURCE CONFIGURATION
 # Specify dataset source and file patterns
 # ============================================================
-DEFAULT_DATA_ROOT = next((Path(p) for p in [os.getenv("DATA_ROOT"), "/mnt/c/Users/muthusamy/Downloads/DataSet/DATA_1_2_3_4_5", "/mnt/c/Users/muthusamy/Downloads/DataSet"] if p and Path(p).exists()), None)
-COMBINATIONS = ["1_true", "2_true", "3_true", "4_true", "5_true"]
-MAP_FILE = "Z_0063.000MHz.map"
-IMPEDANCE_FILE_SUFFIX = "PIPinZ_IC1_Port1.csv"
-DECAPS_FILE = "Decaps.csv"
-SKIP_FIRST_DECAP_ROW = False
+# New raw data structure: Raw folder contains Heatmap/, Imp/, and decap_combination/ folders
+DEFAULT_DATA_ROOT = next((Path(p) for p in [
+    os.getenv("DATA_ROOT"),
+    "/mnt/c/Users/muthusamy/Desktop/Raw",
+    "C:/Users/muthusamy/Desktop/Raw",
+    "/home/ubuntu/gan/raw_data"
+] if p and Path(p).exists()), None)
 
 # ============================================================
-# RANDOM SAMPLE SIZE CONFIGURATION FOR EACH COMBINATION
-# Set to None to include ALL samples from that combination
+# RANDOM SAMPLE SIZE CONFIGURATION
+# Set to None to include ALL samples
 # ============================================================
-SAMPLES_3_TRUE = 4618  # Number of random samples from 3_true
-SAMPLES_4_TRUE = 4618  # Number of random samples from 4_true
-SAMPLES_5_TRUE = 4619  # Number of random samples from 5_true
+MAX_SAMPLES = 15000  # Set to a number to limit samples, or None for all
 # ============================================================
 
 def _read_csv(filepath, cols=None, **kwargs):
@@ -56,113 +52,115 @@ def _read_csv(filepath, cols=None, **kwargs):
         print(f"Error reading {filepath}: {e}")
         return None
 
-def _extract_sample_id(path, from_filename=False):
-    """Extracts sample ID from path or filename - optimized."""
-    if from_filename:
-        # Fast check for filename pattern
-        if m := re.match(r"(\d+)-", path.name):
-            return int(m.group(1))
-    # Fast path search without regex for path-based IDs
-    for part in path.parts:
-        if "PI-" in part:
-            try:
-                idx = part.index("PI-")
-                num_str = part[idx+3:]
-                # Extract only leading digits
-                digits = ""
-                for c in num_str:
-                    if c.isdigit():
-                        digits += c
-                    else:
-                        break
-                if digits:
-                    return int(digits)
-            except (ValueError, IndexError):
-                pass
-    return None
-
-def pair_sample_paths(heatmap_files, impedance_files):
-    """Pairs heatmap and impedance files by sample ID."""
-    h_dict = {sid: p for p in heatmap_files if (sid := _extract_sample_id(p))}
-    i_dict = {sid: p for p in impedance_files if (sid := _extract_sample_id(p, True))}
-    matched = sorted(set(h_dict) & set(i_dict))
-    return [{"sample_id": sid, "heatmap_path": h_dict[sid], "impedance_path": i_dict[sid]} for sid in matched] if matched else [{"sample_id": None, "heatmap_path": heatmap_files[i], "impedance_path": impedance_files[i]} for i in range(min(len(heatmap_files), len(impedance_files)))]
-
-def iter_dataset_samples(data_root=None, combinations=COMBINATIONS, verbose=True):
-    """Iterates through all dataset samples - heavily optimized for speed."""
-    from concurrent.futures import ThreadPoolExecutor
+def iter_dataset_samples(data_root=None, verbose=True):
+    """
+    Iterates through all dataset samples from the new raw data structure.
     
+    New structure:
+    - Raw/
+        - Heatmap/  (contains heatmap files)
+        - Imp/      (contains impedance files)
+        - decap_combination/  (contains CSV with decap vectors as rows)
+    
+    Files are matched by order: 1st heatmap → 1st impedance → 1st CSV row
+    """
     root = Path(data_root) if data_root else DEFAULT_DATA_ROOT
-    if not root:
+    if not root or not root.exists():
         if verbose:
-            print("Error: No dataset root found.")
+            print(f"Error: Dataset root not found: {root}")
         return
     
-    def process_combination(comb):
-        """Process a single combination in a thread."""
-        try:
-            data = _read_csv(root / comb / DECAPS_FILE, header=0)
-            if data is None:
-                return comb, []
-            
-            combos = data.select_dtypes(include=[np.number]).values.astype(np.float32)
-            combos = combos[1:] if SKIP_FIRST_DECAP_ROW else combos
-            comb_root = root / comb
-            
-            # Use direct path patterns (much faster than recursive glob on huge datasets)
-            hm_dir = comb_root / "heatmaps"
-            imp_dir = comb_root / "imp"
-            
-            # Heatmap files are in PI-*/something/{MAP_FILE} - use single level recursion
-            heatmap_files = list(hm_dir.glob(f"PI-*/**/{MAP_FILE}")) if hm_dir.exists() else []
-            
-            # Direct path: PI-*/Power_GND/*PIPinZ... - fast and targeted
-            impedance_files = list(imp_dir.glob(f"PI-*/Power_GND/*{IMPEDANCE_FILE_SUFFIX}")) if imp_dir.exists() else []
-            
-            # Build dictionaries without sorting
-            h_dict = {_extract_sample_id(p): p for p in heatmap_files}
-            i_dict = {_extract_sample_id(p, True): p for p in impedance_files}
-            
-            # Remove None keys
-            h_dict.pop(None, None)
-            i_dict.pop(None, None)
-            
-            # Find matched sample IDs
-            matched_ids = set(h_dict.keys()) & set(i_dict.keys())
-            matched_ids = sorted([sid for sid in matched_ids if sid is not None])
-            
-            samples = []
-            for idx, sid in enumerate(matched_ids):
-                decap_idx = (sid - 1) if (0 <= sid - 1 < len(combos)) else (idx if idx < len(combos) else None)
-                decap_vector = combos[decap_idx] if decap_idx is not None else None
-                
-                samples.append({
-                    "combination": comb,
-                    "sample_id": sid,
-                    "heatmap_path": h_dict[sid],
-                    "impedance_path": i_dict[sid],
-                    "decap_vector": decap_vector,
-                    "decap_index": decap_idx
-                })
-            
-            if verbose:
-                print(f"    Found {len(samples)} samples in {comb}")
-            
-            return comb, samples
-        except Exception as e:
-            print(f"  ERROR processing {comb}: {e}")
-            import traceback
-            traceback.print_exc()
-            return comb, []
+    # Define subdirectories
+    heatmap_dir = root / "Heatmap"
+    imp_dir = root / "Imp"
+    decap_dir = root / "decap_combinations"
     
-    # Parallel collection using threads (I/O bound)
-    print(f"  Scanning combinations in parallel...")
-    with ThreadPoolExecutor(max_workers=len(combinations)) as executor:
-        futures = [executor.submit(process_combination, comb) for comb in combinations]
-        for future in futures:
-            comb, samples = future.result()
-            for sample in samples:
-                yield sample
+    # Validate directories exist
+    if not heatmap_dir.exists():
+        print(f"Error: Heatmap directory not found: {heatmap_dir}")
+        return
+    if not imp_dir.exists():
+        print(f"Error: Impedance directory not found: {imp_dir}")
+        return
+    if not decap_dir.exists():
+        print(f"Error: Decap combination directory not found: {decap_dir}")
+        return
+    
+    # Helper function to extract PI folder number
+    def extract_pi_number(path):
+        """Extract number from PI-* folder in path"""
+        for part in path.parts:
+            if part.startswith('PI-'):
+                try:
+                    return int(part.split('-')[1])
+                except (ValueError, IndexError):
+                    pass
+        return None
+    
+    # Get all heatmap files recursively (PI-*/PowerGround/*.map or similar)
+    heatmap_all_files = [f for f in heatmap_dir.rglob('*') if f.is_file() and f.suffix.lower() == '.map']
+    
+    # Get all impedance files recursively (PI-*/PowerGround/*.csv) - only those with IC1 in name
+    impedance_all_files = [f for f in imp_dir.rglob('*.csv') if f.is_file() and 'IC1' in f.name]
+    
+    # Build dictionaries keyed by PI number
+    heatmap_dict = {}
+    for f in heatmap_all_files:
+        pi_num = extract_pi_number(f)
+        if pi_num is not None:
+            heatmap_dict[pi_num] = f
+    
+    impedance_dict = {}
+    for f in impedance_all_files:
+        pi_num = extract_pi_number(f)
+        if pi_num is not None:
+            impedance_dict[pi_num] = f
+    
+    # Get sorted PI numbers that exist in both heatmap and impedance
+    common_pi_numbers = sorted(set(heatmap_dict.keys()) & set(impedance_dict.keys()))
+    
+    # Get decap combination CSV file(s)
+    decap_csv_files = sorted([f for f in decap_dir.iterdir() if f.is_file() and f.suffix.lower() == '.csv'])
+    
+    if not decap_csv_files:
+        print(f"Error: No CSV files found in {decap_dir}")
+        return
+    
+    # Read decap combinations from the first CSV file
+    decap_csv = decap_csv_files[0]
+    try:
+        decap_data = pd.read_csv(decap_csv, header=None)  # No header, pure data rows
+        decap_vectors = decap_data.select_dtypes(include=[np.number]).values.astype(np.float32)
+        if verbose:
+            print(f"  Loaded {len(decap_vectors)} decap vectors from {decap_csv.name}")
+    except Exception as e:
+        print(f"Error reading decap CSV {decap_csv}: {e}")
+        return
+    
+    if verbose:
+        print(f"  Found {len(heatmap_dict)} heatmap PI folders")
+        print(f"  Found {len(impedance_dict)} impedance PI folders")
+        print(f"  Found {len(common_pi_numbers)} matching PI folders")
+        print(f"  Found {len(decap_vectors)} decap vectors")
+    
+    # Match by order - use minimum count
+    num_samples = min(len(common_pi_numbers), len(decap_vectors))
+    
+    if verbose:
+        print(f"  Matching {num_samples} samples by PI folder order")
+    
+    # Generate samples matched by PI folder index
+    for idx in range(num_samples):
+        pi_num = common_pi_numbers[idx]
+        sample = {
+            "sample_id": idx + 1,
+            "pi_number": pi_num,
+            "heatmap_path": heatmap_dict[pi_num],
+            "impedance_path": impedance_dict[pi_num],
+            "decap_vector": decap_vectors[idx],
+            "decap_index": idx
+        }
+        yield sample
 
 _WORKER_MASK_BOARD = None
 
@@ -194,66 +192,66 @@ def _process_sample(task):
     except Exception as e:
         return (idx, False, str(e)[:100])
 
-def create_training_dataset(output_root=TRAIN_DATA_ROOT, data_root=None, combinations=COMBINATIONS, 
-                            samples_3_true: int | None = SAMPLES_3_TRUE, samples_4_true: int | None = SAMPLES_4_TRUE, 
-                            samples_5_true: int | None = SAMPLES_5_TRUE, num_workers=None, verbose=False):
+def create_training_dataset(output_root=TRAIN_DATA_ROOT, data_root=None, 
+                            max_samples: int | None = MAX_SAMPLES, 
+                            num_workers=None, verbose=False):
     """Creates training dataset with heatmaps, impedance, and occupancy grids."""
     hm_dir, imp_dir, occ_dir = Path(output_root) / "heatmap", Path(output_root) / "Imp", Path(output_root) / "Occ_map"
     for d in (hm_dir, imp_dir, occ_dir):
         d.mkdir(parents=True, exist_ok=True)
     
-    print("Collecting samples...")
-    all_samples = list(iter_dataset_samples(data_root, combinations, verbose=True))
+    print("Collecting samples from new raw data structure...")
+    all_samples = list(iter_dataset_samples(data_root, verbose=True))
     print(f"Found {len(all_samples)} total samples")
     
-    # Separate samples by combination
-    samples_by_comb = {}
-    for sample in all_samples:
-        comb = sample["combination"]
-        if comb not in samples_by_comb:
-            samples_by_comb[comb] = []
-        samples_by_comb[comb].append(sample)
-    
-    print("\nSamples per combination:")
-    for comb in combinations:
-        count = len(samples_by_comb.get(comb, []))
-        print(f"  {comb}: {count} samples")
-    
-    # Strategy: Include all from 1_true and 2_true, randomly select from others
-    selected_samples = []
-    
-    # Add all from 1_true and 2_true
-    for comb in ["1_true", "2_true"]:
-        selected_samples.extend(samples_by_comb.get(comb, []))
-    
-    samples_included = len(selected_samples)
-    print(f"\nIncluded all samples from 1_true and 2_true: {samples_included} samples")
-    
-    # Randomly select from 3_true, 4_true, 5_true based on individual size settings
-    random.seed(42)  # For reproducibility
-    
-    sample_sizes = {
-        "3_true": samples_3_true,
-        "4_true": samples_4_true,
-        "5_true": samples_5_true
-    }
-    
-    for comb, size in sample_sizes.items():
-        available = samples_by_comb.get(comb, [])
-        if size is None or size >= len(available):
-            # Include all samples
-            selected_samples.extend(available)
-            print(f"  {comb}: Including all {len(available)} samples")
-        else:
-            # Randomly select specified number
-            selected = random.sample(available, size)
-            selected_samples.extend(selected)
-            print(f"  {comb}: Randomly selected {size} samples (from {len(available)} available)")
-    
-    print(f"Total selected: {len(selected_samples)} samples")
-    
-    if not selected_samples:
+    if not all_samples:
+        print("No samples found!")
         return 0
+    
+    # Optionally limit samples with smart sampling strategy
+    if max_samples is not None and max_samples < len(all_samples):
+        print(f"Limiting to {max_samples} samples (out of {len(all_samples)} available)")
+        
+        # Strategy: Always include first 54 and last 54, randomly sample from middle
+        FIRST_N = 54
+        LAST_N = 54
+        
+        if max_samples <= FIRST_N + LAST_N:
+            # If max_samples is too small, just take first max_samples
+            print(f"  Max samples ({max_samples}) <= {FIRST_N + LAST_N}, taking first {max_samples} samples")
+            selected_samples = all_samples[:max_samples]
+        else:
+            # Take first 54
+            first_samples = all_samples[:FIRST_N]
+            print(f"  Including first {FIRST_N} samples")
+            
+            # Take last 54
+            last_samples = all_samples[-LAST_N:]
+            print(f"  Including last {LAST_N} samples")
+            
+            # Calculate how many to sample from middle
+            middle_samples_needed = max_samples - FIRST_N - LAST_N
+            
+            # Middle samples (excluding first 54 and last 54)
+            middle_samples = all_samples[FIRST_N:-LAST_N]
+            
+            if middle_samples_needed >= len(middle_samples):
+                # Include all middle samples
+                print(f"  Including all {len(middle_samples)} middle samples")
+                selected_middle = middle_samples
+            else:
+                # Randomly sample from middle
+                import random
+                random.seed(42)  # For reproducibility
+                selected_middle = random.sample(middle_samples, middle_samples_needed)
+                print(f"  Randomly sampled {middle_samples_needed} samples from {len(middle_samples)} middle samples")
+            
+            # Combine: first + middle + last
+            selected_samples = first_samples + selected_middle + last_samples
+            print(f"  Total selected: {len(selected_samples)} samples (first {FIRST_N} + middle {len(selected_middle)} + last {LAST_N})")
+    else:
+        selected_samples = all_samples
+        print(f"Processing all {len(selected_samples)} samples")
     
     # Create tasks with sequential indices
     tasks = [(i, s, hm_dir, imp_dir, occ_dir, verbose) for i, s in enumerate(selected_samples)]
@@ -309,55 +307,24 @@ def create_training_dataset(output_root=TRAIN_DATA_ROOT, data_root=None, combina
     return success_count
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Create training dataset with heatmaps, impedance, and occupancy grids.")
-    parser.add_argument("-o", "--output", type=str, default=str(TRAIN_DATA_ROOT), 
-                       help=f"Output directory for dataset (default: {TRAIN_DATA_ROOT})")
-    parser.add_argument("-d", "--data-root", type=str, default=None,
-                       help="Root directory containing dataset combinations (default: auto-detected)")
-    parser.add_argument("-c", "--combinations", type=str, nargs="+", default=COMBINATIONS,
-                       help=f"Dataset combinations to process (default: {COMBINATIONS})")
-    parser.add_argument("--samples-3", type=int, default=SAMPLES_3_TRUE,
-                       help=f"Random samples from 3_true (default: {SAMPLES_3_TRUE}, use -1 for all)")
-    parser.add_argument("--samples-4", type=int, default=SAMPLES_4_TRUE,
-                       help=f"Random samples from 4_true (default: {SAMPLES_4_TRUE}, use -1 for all)")
-    parser.add_argument("--samples-5", type=int, default=SAMPLES_5_TRUE,
-                       help=f"Random samples from 5_true (default: {SAMPLES_5_TRUE}, use -1 for all)")
-    parser.add_argument("-w", "--workers", type=int, default=4,
-                       help="Number of worker processes (default: 4, use 1 for sequential)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                       help="Enable verbose output")
-    
-    args = parser.parse_args()
-    
     print("=" * 60)
     print("DATASET CREATION CONFIGURATION")
     print("=" * 60)
-    print(f"Output Directory:  {args.output}")
-    print(f"Data Root:         {args.data_root or DEFAULT_DATA_ROOT or 'Not found'}")
-    print(f"Combinations:      {args.combinations}")
-    print(f"Samples 3_true:    {args.samples_3 if args.samples_3 >= 0 else 'All'}")
-    print(f"Samples 4_true:    {args.samples_4 if args.samples_4 >= 0 else 'All'}")
-    print(f"Samples 5_true:    {args.samples_5 if args.samples_5 >= 0 else 'All'}")
-    print(f"Workers:           {args.workers}")
-    print(f"Verbose:           {args.verbose}")
+    print(f"Output Directory:  {TRAIN_DATA_ROOT}")
+    print(f"Data Root:         {DEFAULT_DATA_ROOT or 'Not found'}")
+    print(f"Max Samples:       {MAX_SAMPLES if MAX_SAMPLES else 'All'}")
+    print(f"Workers:           4")
+    print(f"Verbose:           False")
     print("=" * 60)
     print()
     
-    # Convert -1 to None (meaning all samples)
-    s3 = None if args.samples_3 < 0 else args.samples_3
-    s4 = None if args.samples_4 < 0 else args.samples_4
-    s5 = None if args.samples_5 < 0 else args.samples_5
-    
     print("Starting dataset creation...")
     count = create_training_dataset(
-        output_root=args.output,
-        data_root=args.data_root,
-        combinations=args.combinations,
-        samples_3_true=s3,
-        samples_4_true=s4,
-        samples_5_true=s5,
-        num_workers=args.workers,
-        verbose=args.verbose
+        output_root=TRAIN_DATA_ROOT,
+        data_root=None,
+        max_samples=MAX_SAMPLES,
+        num_workers=4,
+        verbose=False
     )
     print(f"✓ Processed {count} samples")
-    print(f"✓ Output saved to: {args.output}")
+    print(f"✓ Output saved to: {TRAIN_DATA_ROOT}")

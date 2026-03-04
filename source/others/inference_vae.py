@@ -73,8 +73,14 @@ class VAEInference:
         self.model.to(self.device)
         self.model.eval()
         
+        # Load standardization parameters
+        self.max_impedance_mean = checkpoint.get('max_impedance_mean', 0.0)
+        self.max_impedance_std = checkpoint.get('max_impedance_std', 1.0)
+        self.model.set_standardization_params(self.max_impedance_mean, self.max_impedance_std)
+        
         self.epoch = checkpoint.get('epoch', 'unknown')
         print(f"Loaded model from epoch: {self.epoch}")
+        print(f"Max impedance stats: mean={self.max_impedance_mean:.4f}, std={self.max_impedance_std:.4f}")
         print(f"Using device: {self.device}")
     
     def generate_save(self, num_samples=1,out_dir="temp_visuals") :
@@ -83,33 +89,44 @@ class VAEInference:
         
         Args:
             num_samples: Number of samples to generate
+            out_dir: Output directory
         
         Returns:
-            Tuple of (heatmap, occupancy, impedance) tensors
+            Tuple of (heatmap_norm, max_impedance_std, occupancy, impedance) tensors
         """
         with torch.no_grad():
             # Sample from standard normal distribution
             z = torch.randn(num_samples, self.latent_dim).to(self.device)
             
             # Generate using decoder
-            heatmap, occupancy, impedance = self.model.decoder(z)
+            heatmap_norm, max_impedance_std, occupancy_logits, impedance = self.model.decoder(z)
             
-            # Apply sigmoid to occupancy if it's logits
-            if occupancy.min() < 0 or occupancy.max() > 1:
-                occupancy = torch.sigmoid(occupancy)
+            # Apply sigmoid to occupancy
+            occupancy = torch.sigmoid(occupancy_logits)
+            
+            # Unstandardize max_impedance from Z-score to raw values
+            max_impedance = self.model.unstandardize_max_impedance(max_impedance_std)
+            
+            # Compute physical heatmap: heatmap_physical = heatmap_norm * max_impedance
+            heatmap_physical = heatmap_norm * max_impedance.view(-1, 1, 1, 1)
             
         output_path = Path(out_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
         # Move to CPU for saving
-        heatmap_cpu = heatmap.cpu().numpy()
+        heatmap_norm_cpu = heatmap_norm.cpu().numpy()
+        heatmap_physical_cpu = heatmap_physical.cpu().numpy()
+        max_impedance_cpu = max_impedance.cpu().numpy()
         occupancy_cpu = occupancy.cpu().numpy()
         impedance_cpu = impedance.cpu().numpy()
         
         print(f"Generated shapes:")
-        print(f"  Heatmap: {heatmap_cpu.shape}")
+        print(f"  Heatmap (normalized): {heatmap_norm_cpu.shape}")
+        print(f"  Heatmap (physical): {heatmap_physical_cpu.shape}")
+        print(f"  Max Impedance: {max_impedance_cpu.shape}")
         print(f"  Occupancy: {occupancy_cpu.shape}")
         print(f"  Impedance: {impedance_cpu.shape}")
+        print(f"  Max Impedance range: [{max_impedance_cpu.min():.4f}, {max_impedance_cpu.max():.4f}]")
         
         # Save raw data
         for i in range(num_samples):
@@ -117,11 +134,15 @@ class VAEInference:
             data_dir = output_path / "data_sample_{}".format(i)  
             data_dir.mkdir(exist_ok=True)
             
-            np.save(data_dir / f"heatmap.npy", heatmap_cpu[i])
+            # Save both normalized and physical heatmaps
+            np.save(data_dir / f"heatmap_norm.npy", heatmap_norm_cpu[i])
+            np.save(data_dir / f"heatmap_physical.npy", heatmap_physical_cpu[i])
+            np.save(data_dir / f"max_impedance.npy", max_impedance_cpu[i])
             np.save(data_dir / f"occupancy_map.npy", occupancy_cpu[i])
             np.save(data_dir / f"impedance_profile.npy", impedance_cpu[i])
             
-            print(f"\nSaved {num_samples} data files to: {data_dir}")
+            print(f"\nSaved sample {i} data to: {data_dir}")
+            print(f"  Max impedance value: {max_impedance_cpu[i].item():.4f}")
         
 
   
