@@ -3,7 +3,7 @@ Data loader for Multi-Input VAE training
 
 Loads three modalities from disk:
 1. Heatmap: 64x64x2
-2. Occupancy Map: 7x8x1
+2. Occupancy Vector: 52
 3. Impedance Vector: 231x1
 """
 
@@ -98,15 +98,12 @@ class VAEDataset(Dataset):
         # Load impedance (231,)
         impedance = np.load(self.impedance_dir / f"{filename}.npy")  # (231,)
         
-        # Load occupancy (7, 8) or (7, 8, 1)
-        occupancy = np.load(self.occupancy_dir / f"{filename}.npy")
-        if occupancy.ndim == 2:
-            occupancy = np.expand_dims(occupancy, axis=-1)  # (7, 8, 1)
+        # Load occupancy vector (52,)
+        occupancy = np.load(self.occupancy_dir / f"{filename}.npy").flatten()  # (52,)
         
-        # Apply normalization if available (for impedance/occupancy only)
+        # Apply normalization if available (for impedance only)
         if self.normalize and self.stats:
             impedance = self._normalize(impedance, 'impedance')
-            occupancy = self._normalize(occupancy, 'occupancy')
         
         # 🎯 PHYSICALLY-AWARE: Load max_impedance from stored file (already Z-score normalized)
         if self.has_max_values:
@@ -123,10 +120,7 @@ class VAEDataset(Dataset):
         heatmap_norm = torch.from_numpy(heatmap_norm).float()  # (2, 64, 64)
         max_impedance_std = torch.tensor([max_impedance_normalized], dtype=torch.float32)  # (1,) - already normalized
         impedance = torch.from_numpy(impedance).float().view(-1)  # (231,)
-        # Occupancy needs permute from (H, W, C) to (C, H, W)
-        occupancy = torch.from_numpy(occupancy).permute(2, 0, 1).float()  # (1, 7, 8)
-        if occupancy.max() > 1.0:
-            occupancy = occupancy / 255.0
+        occupancy = torch.from_numpy(occupancy).float()  # (52,)
         occupancy = torch.clamp(occupancy, 0.0, 1.0)
         
         return {

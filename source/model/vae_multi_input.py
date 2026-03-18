@@ -660,9 +660,8 @@ class MasterFeatureGridDecoder(nn.Module):
 
 
 class HeatmapDecoder(nn.Module):
-    """Decoder for 64x64x2 heatmap with STABILITY-FIRST Broadcasting Trick
+    """Decoder for 64x64x2 heatmap - independent decoder head
     
-    Broadcasts STANDARDIZED (Z-score) max_impedance for numerical stability.
     Outputs NORMALIZED heatmap [0,1] via sigmoid for bounded predictions.
     """
     
@@ -675,10 +674,6 @@ class HeatmapDecoder(nn.Module):
         self.heatmap_attn = SelfAttention2D(grid_channels)
         self.heatmap_attn_norm = nn.LayerNorm([grid_channels, 16, 16])
         
-        # Broadcasting fusion: add 1 channel for broadcast max_impedance at 16x16
-        self.broadcast_fusion_16 = nn.Conv2d(grid_channels + 1, grid_channels, kernel_size=1)
-        self.broadcast_bn_16 = nn.BatchNorm2d(grid_channels)
-        
         # Residual conv blocks
         self.residual_conv1 = nn.Conv2d(grid_channels, grid_channels, kernel_size=3, padding=1)
         self.residual_bn1 = nn.BatchNorm2d(grid_channels)
@@ -686,10 +681,6 @@ class HeatmapDecoder(nn.Module):
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
         self.conv1 = nn.Conv2d(grid_channels, 64, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(64)
-        
-        # Broadcasting fusion at 32x32
-        self.broadcast_fusion_32 = nn.Conv2d(64 + 1, 64, kernel_size=1)
-        self.broadcast_bn_32 = nn.BatchNorm2d(64)
         
         # Second residual conv block for 64-channel features
         self.residual_conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
@@ -702,25 +693,16 @@ class HeatmapDecoder(nn.Module):
         
         self.apply(_init_weights)
         
-    def forward(self, master_grid: torch.Tensor, max_impedance_std: torch.Tensor) -> torch.Tensor:
+    def forward(self, master_grid: torch.Tensor) -> torch.Tensor:
         """
         Args:
             master_grid: (batch_size, grid_channels, 16, 16)
-            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
         Returns:
             heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap [0, 1]
         """
-        B = master_grid.size(0)
-        
         # Start from shared 16x16 grid with attention and residual connections
         attn_out = self.heatmap_attn(master_grid)  # (B, grid_channels, 16, 16)
         x = self.heatmap_attn_norm(attn_out)  # Layer norm after attention
-        
-        # 📡 STABILITY-FIRST BROADCASTING at 16x16: Inject STANDARDIZED max_impedance
-        # Broadcast Z-score (mean~0, std~1) to 16x16 spatial grid for stability
-        max_imp_broadcast = max_impedance_std.view(B, 1, 1, 1).expand(B, 1, 16, 16)  # (B, 1, 16, 16)
-        x_with_max = torch.cat([x, max_imp_broadcast], dim=1)  # (B, grid_channels+1, 16, 16)
-        x = F.relu(self.broadcast_bn_16(self.broadcast_fusion_16(x_with_max)))  # (B, grid_channels, 16, 16)
         
         # First residual block at 16x16
         residual = x
@@ -731,11 +713,6 @@ class HeatmapDecoder(nn.Module):
         x = F.relu(self.bn1(self.conv1(x)))  # (B, 64, 16, 16)
         x = self.upsample(x)  # 32x32
         
-        # 📡 STABILITY-FIRST BROADCASTING at 32x32: Inject STANDARDIZED max_impedance again
-        max_imp_broadcast_32 = max_impedance_std.view(B, 1, 1, 1).expand(B, 1, 32, 32)  # (B, 1, 32, 32)
-        x_with_max_32 = torch.cat([x, max_imp_broadcast_32], dim=1)  # (B, 65, 32, 32)
-        x = F.relu(self.broadcast_bn_32(self.broadcast_fusion_32(x_with_max_32)))  # (B, 64, 32, 32)
-        
         # Second residual block at 32x32 for 64-channel features
         residual = x  
         x = F.relu(self.residual_bn2(self.residual_conv2(x)))
@@ -744,26 +721,22 @@ class HeatmapDecoder(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))  # (B, 32, 32, 32)
         x = self.upsample(x)  # 64x64
         
-        # ⚡ STABILITY-FIRST: Output normalized heatmap with SIGMOID for bounded [0, 1]
+        # Output normalized heatmap with SIGMOID for bounded [0, 1]
         x = torch.sigmoid(self.conv3(x))  # (B, 2, 64, 64) - Guaranteed [0, 1]
         
         return x
     
-    def forward_with_dropout(self, master_grid: torch.Tensor, max_impedance_std: torch.Tensor, 
-                             dropout_prob: float = 0.05) -> torch.Tensor:
+    def forward_with_dropout(self, master_grid: torch.Tensor, dropout_prob: float = 0.05) -> torch.Tensor:
         """
         Forward pass with feature dropout applied at intermediate layers.
         Weakens decoder by randomly zeroing intermediate feature representations.
         
         Args:
             master_grid: (batch_size, grid_channels, 16, 16)
-            max_impedance_std: (batch_size, 1) - STANDARDIZED max impedance (Z-score)
             dropout_prob: Probability of zeroing intermediate features
         Returns:
             heatmap_norm: (batch_size, 2, 64, 64) - NORMALIZED heatmap
         """
-        B = master_grid.size(0)
-        
         # Start from shared 16x16 grid with attention and residual connections
         attn_out = self.heatmap_attn(master_grid)  # (B, grid_channels, 16, 16)
         x = self.heatmap_attn_norm(attn_out)  # Layer norm after attention
@@ -771,11 +744,6 @@ class HeatmapDecoder(nn.Module):
         # Apply dropout after attention during training
         if self.training and dropout_prob > 0:
             x = F.dropout2d(x, p=dropout_prob, training=True, inplace=False)
-        
-        # 📡 STABILITY-FIRST BROADCASTING at 16x16: Inject STANDARDIZED max_impedance
-        max_imp_broadcast = max_impedance_std.view(B, 1, 1, 1).expand(B, 1, 16, 16)  # (B, 1, 16, 16)
-        x_with_max = torch.cat([x, max_imp_broadcast], dim=1)  # (B, grid_channels+1, 16, 16)
-        x = F.relu(self.broadcast_bn_16(self.broadcast_fusion_16(x_with_max)))  # (B, grid_channels, 16, 16)
         
         # First residual block at 16x16
         residual = x
@@ -790,11 +758,6 @@ class HeatmapDecoder(nn.Module):
         if self.training and dropout_prob > 0:
             x = F.dropout2d(x, p=dropout_prob * 0.5, training=True, inplace=False)  # Reduced dropout deeper in network
         
-        # 📡 STABILITY-FIRST BROADCASTING at 32x32: Inject STANDARDIZED max_impedance again
-        max_imp_broadcast_32 = max_impedance_std.view(B, 1, 1, 1).expand(B, 1, 32, 32)  # (B, 1, 32, 32)
-        x_with_max_32 = torch.cat([x, max_imp_broadcast_32], dim=1)  # (B, 65, 32, 32)
-        x = F.relu(self.broadcast_bn_32(self.broadcast_fusion_32(x_with_max_32)))  # (B, 64, 32, 32)
-        
         # Second residual block at 32x32 for 64-channel features
         residual = x  
         x = F.relu(self.residual_bn2(self.residual_conv2(x)))
@@ -803,7 +766,7 @@ class HeatmapDecoder(nn.Module):
         x = F.relu(self.bn2(self.conv2(x)))  # (B, 32, 32, 32)
         x = self.upsample(x)  # 64x64
         
-        # ⚡ STABILITY-FIRST: Output normalized heatmap with SIGMOID for bounded [0, 1]
+        # Output normalized heatmap with SIGMOID for bounded [0, 1]
         x = torch.sigmoid(self.conv3(x))  # (B, 2, 64, 64) - Guaranteed [0, 1]
         
         return x
@@ -1086,9 +1049,9 @@ class Decoder(nn.Module):
         # Step 2: Create shared master feature grid (16x16x128)
         master_grid = self.master_grid_dec(z)  # (B, grid_channels, 16, 16)
         
-        # Step 3: Spatial branches with STANDARDIZED broadcasting
-        # Heatmap decoder uses Z-score for conditioning, outputs sigmoid-bounded [0, 1]
-        heatmap_norm = self.heatmap_dec(master_grid, max_impedance_std)  # (B, 2, 64, 64)
+        # Step 3: Spatial branches - independent decoder heads
+        # Heatmap decoder outputs sigmoid-bounded [0, 1]
+        heatmap_norm = self.heatmap_dec(master_grid)  # (B, 2, 64, 64)
         occupancy = self.occupancy_dec(master_grid)
         
         # Step 4: Impedance remains independent (non-spatial)
@@ -1124,9 +1087,9 @@ class Decoder(nn.Module):
             z, dropout_prob=master_grid_dropout_prob
         )
         
-        # Step 3: Spatial branches with STANDARDIZED broadcasting and dropout
+        # Step 3: Spatial branches - independent decoder heads with dropout
         heatmap_norm = self.heatmap_dec.forward_with_dropout(
-            master_grid, max_impedance_std, dropout_prob=feature_dropout_prob
+            master_grid, dropout_prob=feature_dropout_prob
         )
         occupancy = self.occupancy_dec.forward_with_dropout(master_grid, dropout_prob=feature_dropout_prob)
         

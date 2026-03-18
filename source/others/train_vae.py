@@ -15,17 +15,8 @@ if str(SOURCE_DIR) not in sys.path:
 from model.vae_multi_input import MultiInputVAE
 from loss.vae_loss import VAELoss
 from others.vae_logger import VAETrainingLogger
-from others.dataloader import create_data_loaders, VAEDataset, compute_max_impedance_statistics
+from others.dataloader import create_data_loaders, VAEDataset
 from others.model_to_config import model_to_config_generic
-
-try:
-    scripts_path = Path(__file__).parent.parent.parent / "scripts"
-    if str(scripts_path) not in sys.path:
-        sys.path.insert(0, str(scripts_path))
-    from monitor_attention_gammas import log_gamma_values
-    GAMMA_MONITORING_AVAILABLE = True
-except ImportError:
-    GAMMA_MONITORING_AVAILABLE = False
 
 
 def compute_beta_annealing(current_epoch: int, start_epoch: int, 
@@ -51,64 +42,47 @@ def ensure_channel_first(tensor: torch.Tensor, expected_channels: int) -> torch.
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    num_epochs: int = 150
+    num_epochs: int = 300
     batch_size: int = 64
     learning_rate: float = 1e-5
     latent_dim: int = 32
     seed: int = 42
-
-    heatmap_weight: float = 5.0  # DEPRECATED: Now using uncertainty-based weighting
-    occupancy_weight: float = 2.0  # DEPRECATED: Now using uncertainty-based weighting  
-    impedance_weight: float = 5.0  # DEPRECATED: Now using uncertainty-based weighting
-    kl_weight: float = 0.01  # Good balance: KL contributes ~0.2 to total loss vs ~1.0 recon
-                             # Raw KL values look high (~100) but effective contribution is reasonable
+    kl_weight: float = 0.01
     
-    # Uncertainty-based weighting parameters (Kendall et al.)
-    # These control the initial uncertainty values for automatic loss balancing
-    init_log_sigma_heatmap: float = -0.5    # Initial log(σ) for heatmap uncertainty
-    init_log_sigma_occupancy: float = -0.3   # Initial log(σ) for occupancy uncertainty (higher = easier task)
-    init_log_sigma_impedance: float = -0.5   # Initial log(σ) for impedance uncertainty
-    
-    occupancy_bce_weight: float = 0.5
-    occupancy_dice_weight: float = 0.5
-    impedance_cosine_weight: float = 0.7
-    impedance_mse_weight: float = 0.3
+    init_log_sigma_heatmap: float = -0.2
+    init_log_sigma_occupancy: float = -1.2
+    init_log_sigma_impedance: float = -0.2
 
     beta_annealing_enabled: bool = False
     beta_anneal_start_epoch: int = 0
-    beta_anneal_end_epoch: int = 75
-    beta_max: float = 0.4
+    beta_anneal_end_epoch: int = 200
+    beta_max: float = 0.2
 
-    data_dir: str = "datasets/source/data_norm"
+    data_dir: str = "datasets/data_norm"
     normalize: bool = False
     train_split: float = 0.9
     num_workers: int = 4
 
-    experiment_dir: str = "experiments/exp012"
+    experiment_dir: str = "experiments/exp013"
     log_dir: str = "logs"
     checkpoint_dir: str = "checkpoints"
     checkpoint_interval: int = 10
-    resume_from_checkpoint: Optional[str] = "checkpoint_epoch_60.pt"  # Path to checkpoint file to resume from
+    resume_from_checkpoint: Optional[str] = "checkpoint_epoch_100.pt"  # Path to checkpoint file to resume from
 
-    attn_lr_multiplier: float = 4.0
-    attn_lr_max_multiplier: float = 6.0
-    attn_boost_threshold: float = 0.02
-    attn_boost_patience: int = 5
-    attn_boost_factor: float = 1.5
+    attn_lr_multiplier: float = 10.0
+    attn_lr_max_multiplier: float = 15.0
 
-    # Decoder weakening parameters to prevent overpowerful decoder
+
     decoder_dropout_enabled: bool = True
-    latent_dropout_prob: float = 0.15       # Randomly zero out latent dimensions
-    master_grid_dropout_prob: float = 0.10  # Dropout in shared feature grid
-    feature_dropout_prob: float = 0.05      # Dropout in decoder intermediate layers
+    latent_dropout_prob: float = 0.15
+    master_grid_dropout_prob: float = 0.10
+    feature_dropout_prob: float = 0.05
     
-    # 🎯 NEW: Enhanced occupancy loss configuration 
-    occupancy_loss_type: str = 'triple'  # 'bce', 'weighted_bce', 'dice', 'focal', 'dice_focal', 'combo', 'triple'
-    occupancy_pos_weight: float = 15.0  # Weight positive class 15x higher
-    focal_alpha: float = 0.25  # Focal loss alpha
-    focal_gamma: float = 2.0   # Focal loss gamma
-    static_occupancy_weight: Optional[float] = 5.0  # Static weight for first N epochs
-    static_weight_epochs: int = 50  # Number of epochs to use static weight
+    occupancy_loss_type: str = 'dice_bce'
+    static_occupancy_weight: Optional[float] = 10.0
+    static_weight_epochs: int = 100
+    heatmap_gradient_weight: float = 0.1  # Weight for spatial gradient loss on heatmap
+    impedance_gradient_weight: float = 0.1  # Weight for gradient loss to capture impedance peaks
 
     def resolve_paths(self) -> tuple[Path, Path, Path]:
         exp_path = Path(self.experiment_dir)
@@ -144,36 +118,24 @@ class VAETrainer:
         self.loss_fn = loss_fn
         self.logger = logger
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.attn_group_idx: Optional[int] = None
         self.attn_lr_base = lr * attn_lr_multiplier
         self.attn_lr_max = lr * attn_lr_max_multiplier
         self.max_impedance_mean = max_impedance_mean
         self.max_impedance_std = max_impedance_std
 
-        base_params = []
-        attn_params = []
-        # Include model parameters
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if 'gamma' in name:
-                attn_params.append(param)
-            else:
-                base_params.append(param)
+        # Collect all trainable parameters (model + loss function uncertainty params)
+        params = []
+        for param in self.model.parameters():
+            if param.requires_grad:
+                params.append(param)
         
-        # Include loss function uncertainty parameters
         for name, param in self.loss_fn.named_parameters():
             if param.requires_grad:
-                base_params.append(param)
+                params.append(param)
                 if logger:
                     logger.info(f"Added loss parameter to optimizer: {name}")
 
-        param_groups = [{'params': base_params, 'lr': lr}]
-        if attn_params:
-            self.attn_group_idx = len(param_groups)
-            param_groups.append({'params': attn_params, 'lr': self.attn_lr_base})
-
-        self.optimizer = optim.Adam(param_groups)
+        self.optimizer = optim.Adam(params, lr=lr)
         self.model.to(self.device)
         self.loss_fn.to(self.device)
         
@@ -182,7 +144,8 @@ class VAETrainer:
     
     def train_step(self, heatmap: torch.Tensor, max_impedance_std: torch.Tensor,
                    occupancy: torch.Tensor, impedance: torch.Tensor, beta: float = 1.0,
-                   decoder_dropout_config: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+                   decoder_dropout_config: Optional[Dict[str, float]] = None,
+                   compute_grad_norms: bool = False) -> Dict[str, Any]:
         self.model.train()
         self.optimizer.zero_grad()
         
@@ -201,12 +164,39 @@ class VAETrainer:
             use_physical_loss=True
         )
         loss_dict['total_loss'].backward()
+        
+        # Compute gradient norms per output head if requested
+        grad_norms = {}
+        if compute_grad_norms:
+            with torch.no_grad():
+                # Heatmap decoder gradients
+                heatmap_grads = [p.grad.norm().item() for p in self.model.decoder.heatmap_dec.parameters() 
+                                if p.grad is not None]
+                grad_norms['heatmap_grad_norm'] = sum(heatmap_grads) / max(len(heatmap_grads), 1)
+                
+                # Max impedance decoder gradients
+                max_imp_grads = [p.grad.norm().item() for p in self.model.decoder.max_impedance_dec.parameters() 
+                                if p.grad is not None]
+                grad_norms['max_imp_grad_norm'] = sum(max_imp_grads) / max(len(max_imp_grads), 1)
+                
+                # Occupancy decoder gradients
+                occ_grads = [p.grad.norm().item() for p in self.model.decoder.occupancy_dec.parameters() 
+                            if p.grad is not None]
+                grad_norms['occupancy_grad_norm'] = sum(occ_grads) / max(len(occ_grads), 1)
+                
+                # Impedance decoder gradients
+                imp_grads = [p.grad.norm().item() for p in self.model.decoder.impedance_dec.parameters() 
+                            if p.grad is not None]
+                grad_norms['impedance_grad_norm'] = sum(imp_grads) / max(len(imp_grads), 1)
+        
         # Gradient clipping for both model and loss function parameters
         all_params = list(self.model.parameters()) + list(self.loss_fn.parameters())
         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         self.optimizer.step()
         
-        return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+        result = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+        result.update(grad_norms)
+        return result
     
     def eval_step(self, heatmap: torch.Tensor, max_impedance_std: torch.Tensor,
                   occupancy: torch.Tensor, impedance: torch.Tensor, beta: float = 1.0) -> Dict[str, float]:
@@ -235,65 +225,87 @@ class VAETrainer:
         torch.save(checkpoint, path)
     
     def load_checkpoint(self, path: str) -> int:
-        """Load checkpoint and return the epoch number to resume from"""
+        """Load checkpoint and return the epoch number"""
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Try to load optimizer state, but handle parameter group mismatches gracefully
         try:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if hasattr(self, 'logger') and self.logger:
-                self.logger.info("Successfully loaded optimizer state")
         except ValueError as e:
-            if "parameter group" in str(e):
-                if hasattr(self, 'logger') and self.logger:
-                    self.logger.info("⚠️  Optimizer parameter groups don't match checkpoint - reinitializing optimizer state")
-                    self.logger.info("This is normal when model architecture or parameter grouping has changed")
-                # Don't load optimizer state - it will start fresh but model weights are loaded
-            else:
-                raise e
+            if "parameter group" in str(e) and self.logger:
+                self.logger.info("Reinitializing optimizer (parameter groups changed)")
         
-        # Load loss function parameters if available (backward compatibility)
         if 'loss_fn_state_dict' in checkpoint:
             self.loss_fn.load_state_dict(checkpoint['loss_fn_state_dict'])
-            if hasattr(self, 'logger') and self.logger:
-                self.logger.info("Loaded uncertainty parameters from checkpoint")
-        else:
-            if hasattr(self, 'logger') and self.logger:
-                self.logger.info("No uncertainty parameters in checkpoint - using defaults")
         
-        # Extract epoch number from checkpoint if available
-        epoch = checkpoint.get('epoch', 0)
-        return epoch
+        return checkpoint.get('epoch', 0)
 
     def uncertainty_summary(self) -> Dict[str, float]:
-       # """Get current uncertainty parameter values for monitoring"""
+        """Get current uncertainty parameter values"""
         with torch.no_grad():
             return {
                 'sigma_heatmap': torch.exp(self.loss_fn.log_sigma_heatmap).item(),
                 'sigma_occupancy': torch.exp(self.loss_fn.log_sigma_occupancy).item(),
-                'sigma_impedance': torch.exp(self.loss_fn.log_sigma_impedance).item(),
-                'log_sigma_heatmap': self.loss_fn.log_sigma_heatmap.item(),
-                'log_sigma_occupancy': self.loss_fn.log_sigma_occupancy.item(),
-                'log_sigma_impedance': self.loss_fn.log_sigma_impedance.item(),
+                'sigma_impedance': torch.exp(self.loss_fn.log_sigma_impedance).item()
+            }
+    
+    def kl_per_dimension_stats(self, heatmap: torch.Tensor, max_impedance_std: torch.Tensor,
+                              occupancy: torch.Tensor, impedance: torch.Tensor) -> Dict[str, float]:
+        """Compute KL divergence per latent dimension to detect collapsed dimensions"""
+        self.model.eval()
+        with torch.no_grad():
+            mu, logvar = self.model.encoder(heatmap, max_impedance_std, occupancy, impedance)
+            # KL per dimension: -0.5 * (1 + log(σ²) - μ² - σ²)
+            kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+            kl_per_dim = kl_per_dim.mean(dim=0)  # Average over batch
+            
+            # Statistics
+            kl_mean = kl_per_dim.mean().item()
+            kl_std = kl_per_dim.std().item()
+            kl_max = kl_per_dim.max().item()
+            kl_min = kl_per_dim.min().item()
+            
+            # Count near-zero dims (collapsed posterior)
+            near_zero = (kl_per_dim < 0.01).sum().item()
+            active_dims = (kl_per_dim >= 0.01).sum().item()
+            
+            return {
+                'kl_dim_mean': kl_mean,
+                'kl_dim_std': kl_std,
+                'kl_dim_max': kl_max,
+                'kl_dim_min': kl_min,
+                'kl_collapsed_dims': near_zero,
+                'kl_active_dims': active_dims,
+                'kl_active_ratio': active_dims / self.model.latent_dim
             }
 
-    def attention_gamma_stats(self) -> Tuple[float, int]:
-        gammas = [param.detach().view(-1) for name, param in self.model.named_parameters() if 'gamma' in name]
-        if not gammas:
-            return 0.0, 0
-        values = torch.cat(gammas)
-        return float(values.abs().mean().item()), values.numel()
-
-    def boost_attention_lr(self, factor: float) -> Optional[float]:
-        if self.attn_group_idx is None:
-            return None
-        group = self.optimizer.param_groups[self.attn_group_idx]
-        new_lr = min(group['lr'] * factor, self.attn_lr_max)
-        if new_lr > group['lr']:
-            group['lr'] = new_lr
-            return new_lr
-        return None
+    def log_attention_architecture(self):
+        """Log attention layer placement"""
+        if not hasattr(self, 'logger') or not self.logger:
+            return
+        
+        self.logger.info("\n" + "="*80)
+        self.logger.info("ATTENTION LAYER PLACEMENT")
+        self.logger.info("="*80)
+        
+        attention_locations = []
+        for name, module in self.model.named_modules():
+            if 'attention' in name.lower() or 'attn' in name.lower():
+                attention_locations.append(name)
+        
+        if attention_locations:
+            encoder_attn = [loc for loc in attention_locations if 'encoder' in loc]
+            decoder_attn = [loc for loc in attention_locations if 'decoder' in loc]
+            
+            self.logger.info(f"Encoder layers: {len(encoder_attn)}")
+            self.logger.info(f"Decoder layers: {len(decoder_attn)}")
+            
+            if len(encoder_attn) == 0:
+                self.logger.info("WARNING: No encoder attention (all post-bottleneck)")
+        else:
+            self.logger.info("No attention layers found")
+        
+        self.logger.info("="*80)
 
 
 def train_vae(config: Optional[TrainingConfig] = None, **overrides):
@@ -309,44 +321,15 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
 
     if cfg.beta_annealing_enabled:
         logger.log_beta_schedule(cfg.beta_anneal_start_epoch, cfg.beta_anneal_end_epoch, cfg.beta_max)
-    else:
-        logger.info(f"KL Annealing disabled (KL weight = {cfg.kl_weight})")
-        
-    # Log decoder weakening configuration
+    
     if cfg.decoder_dropout_enabled:
-        logger.info(f"Decoder weakening enabled:")
-        logger.info(f"  - Latent dropout: {cfg.latent_dropout_prob:.3f}")
-        logger.info(f"  - Master grid dropout: {cfg.master_grid_dropout_prob:.3f}")
-        logger.info(f"  - Feature dropout: {cfg.feature_dropout_prob:.3f}")
-    else:
-        logger.info("Decoder weakening disabled")
+        logger.info(f"Decoder dropout enabled (latent: {cfg.latent_dropout_prob:.2f}, grid: {cfg.master_grid_dropout_prob:.2f})")
     
-    # Log KL scaling information
-    # Calculate scaling factor (same as in loss function)
-    total_recon_elements = 64 * 64 * 2 + 7 * 8 * 1 + 231  # 8,479 elements  
+    total_recon_elements = 64 * 64 * 2 + 7 * 8 * 1 + 231
     kl_scaling_factor = total_recon_elements / cfg.latent_dim
-    effective_kl_weight = cfg.kl_weight * kl_scaling_factor
-    logger.info(f"Loss configuration:")
-    logger.info(f"  KL loss scaling:")
-    logger.info(f"    - Total reconstruction elements: {total_recon_elements}")
-    logger.info(f"    - Latent dimensions: {cfg.latent_dim}")
-    logger.info(f"    - KL scaling factor: {kl_scaling_factor:.1f}")
-    logger.info(f"    - Base KL weight: {cfg.kl_weight}")
-    logger.info(f"    - Effective KL weight: {effective_kl_weight:.3f}")
-    logger.info(f"  Uncertainty-based weighting (Kendall et al.):")
-    logger.info(f"    - Initial σ heatmap: {torch.exp(torch.tensor(cfg.init_log_sigma_heatmap)):.3f}")
-    logger.info(f"    - Initial σ occupancy: {torch.exp(torch.tensor(cfg.init_log_sigma_occupancy)):.3f}")
-    logger.info(f"    - Initial σ impedance: {torch.exp(torch.tensor(cfg.init_log_sigma_impedance)):.3f}")
+    logger.info(f"KL scaling factor: {kl_scaling_factor:.1f} (base weight: {cfg.kl_weight})")
     
-    # 🎯 STEP 1: Compute max_impedance statistics for Z-score standardization
-    logger.info(f"\n{'='*80}")
-    logger.info("STEP 1: Computing max_impedance statistics for Z-score standardization")
-    logger.info(f"{'='*80}")
-    max_impedance_mean, max_impedance_std_val = compute_max_impedance_statistics(
-        data_dir=cfg.data_dir,
-        num_samples=1000  # Sample 1000 for statistics
-    )
-    logger.info(f"✅ Z-score parameters: mean={max_impedance_mean:.6f}, std={max_impedance_std_val:.6f}")
+    max_impedance_mean, max_impedance_std_val = 0.0, 1.0
     
     model = MultiInputVAE(latent_dim=cfg.latent_dim)
     loss_fn = VAELoss(
@@ -354,17 +337,11 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
         init_log_sigma_occupancy=cfg.init_log_sigma_occupancy,
         init_log_sigma_impedance=cfg.init_log_sigma_impedance,
         kl_weight=cfg.kl_weight,
-        # 🎯 NEW: Enhanced occupancy loss parameters
         occupancy_loss_type=cfg.occupancy_loss_type,
-        occupancy_pos_weight=cfg.occupancy_pos_weight,
-        focal_alpha=cfg.focal_alpha,
-        focal_gamma=cfg.focal_gamma,
         static_occupancy_weight=cfg.static_occupancy_weight,
         static_weight_epochs=cfg.static_weight_epochs,
-        occupancy_bce_weight=cfg.occupancy_bce_weight,
-        occupancy_dice_weight=cfg.occupancy_dice_weight,
-        impedance_cosine_weight=cfg.impedance_cosine_weight,
-        impedance_mse_weight=cfg.impedance_mse_weight,
+        heatmap_gradient_weight=cfg.heatmap_gradient_weight,
+        impedance_gradient_weight=cfg.impedance_gradient_weight
     )
 
     trainer = VAETrainer(
@@ -379,41 +356,23 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
         max_impedance_std=max_impedance_std_val,
     )
 
-    # Handle checkpoint resumption
     start_epoch = 0
     if cfg.resume_from_checkpoint:
         checkpoint_path_to_load = Path(cfg.resume_from_checkpoint)
         if not checkpoint_path_to_load.is_absolute():
             checkpoint_path_to_load = checkpoint_path / cfg.resume_from_checkpoint
         
-        logger.info(f"\nAttempting to load checkpoint from: {checkpoint_path_to_load}")
-        logger.info(f"Checkpoint exists: {checkpoint_path_to_load.exists()}")
-        
         if checkpoint_path_to_load.exists():
-            logger.info(f"Resuming from checkpoint: {checkpoint_path_to_load}")
+            logger.info(f"Resuming from: {checkpoint_path_to_load}")
             start_epoch = trainer.load_checkpoint(str(checkpoint_path_to_load))
-            logger.info(f"Epoch from checkpoint: {start_epoch}")
             
-            # Fallback: extract epoch from filename if not in checkpoint
             if start_epoch == 0:
                 import re
-                # Handle both "epoch_30.pt" and "checkpoint_epoch_30.pt" formats
                 match = re.search(r'(?:checkpoint_)?epoch[_\s-]*(\d+)', checkpoint_path_to_load.name, re.IGNORECASE)
                 if match:
                     start_epoch = int(match.group(1))
-                    logger.info(f"Extracted epoch {start_epoch} from checkpoint filename: {checkpoint_path_to_load.name}")
-                else:
-                    logger.info(f"Could not extract epoch from filename: {checkpoint_path_to_load.name}")
             
-            logger.info(f"==> Resuming training from epoch {start_epoch + 1} (continuing from {start_epoch})")
-        else:
-            logger.info(f"WARNING: Checkpoint not found at {checkpoint_path_to_load}")
-            logger.info("Starting training from scratch")
-            logger.info("Starting training from scratch")
-    
-    if GAMMA_MONITORING_AVAILABLE and start_epoch == 0:
-        logger.info("\nInitial gamma values:")
-        log_gamma_values(trainer.model, epoch=0)
+            logger.info(f"Resuming from epoch {start_epoch + 1}")
 
     try:
         temp_path = exp_path / ".temp_model.pt"
@@ -432,16 +391,12 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
         normalize=cfg.normalize,
         train_split=cfg.train_split,
         seed=cfg.seed,
-        max_impedance_mean=max_impedance_mean,
-        max_impedance_std=max_impedance_std_val,
     )
 
     train_batches = len(train_loader)
     val_batches = len(val_loader)
-    low_gamma_epochs = 0
 
     for epoch in range(start_epoch, cfg.num_epochs):
-        # 🎯 NEW: Update loss function's current epoch for static weight logic
         loss_fn.set_current_epoch(epoch)
         
         beta = (
@@ -473,10 +428,22 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
                     'feature_dropout_prob': cfg.feature_dropout_prob
                 }
 
+            # Compute gradient norms on first batch of epoch for monitoring
+            compute_grad_norms = (batch_idx == 0 and (epoch + 1) % 10 == 0)
             batch_losses = trainer.train_step(heatmap, max_impedance_std, occupancy, impedance, beta=beta, 
-                                             decoder_dropout_config=decoder_dropout_config)
+                                             decoder_dropout_config=decoder_dropout_config,
+                                             compute_grad_norms=compute_grad_norms)
+            
+            if compute_grad_norms and 'heatmap_grad_norm' in batch_losses:
+                logger.info(f"\nEpoch {epoch+1} Gradient norms:")
+                logger.info(f"  Heatmap: {batch_losses['heatmap_grad_norm']:.4f}")
+                logger.info(f"  Occupancy: {batch_losses['occupancy_grad_norm']:.4f}")
+                logger.info(f"  Impedance: {batch_losses['impedance_grad_norm']:.4f}")
+
+            
             for key in epoch_losses:
-                epoch_losses[key] += batch_losses[key]
+                if key in batch_losses:
+                    epoch_losses[key] += batch_losses[key]
 
         average_losses(epoch_losses, train_batches)
 
@@ -492,19 +459,6 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
                 val_losses[key] += val_batch_losses[key]
 
         average_losses(val_losses, val_batches)
-
-        mean_gamma, gamma_count = trainer.attention_gamma_stats()
-        if gamma_count:
-            logger.info(f"Attention |γ| mean: {mean_gamma:.4f} across {gamma_count} params")
-            if mean_gamma < cfg.attn_boost_threshold:
-                low_gamma_epochs += 1
-                if low_gamma_epochs >= cfg.attn_boost_patience:
-                    boosted_lr = trainer.boost_attention_lr(cfg.attn_boost_factor)
-                    if boosted_lr is not None:
-                        logger.info(f"Boosted attention LR to {boosted_lr:.2e} to encourage activation")
-                    low_gamma_epochs = 0
-            else:
-                low_gamma_epochs = 0
 
         logger.log(
             epoch + 1,
@@ -552,9 +506,21 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
                 sigma_occ = torch.exp(trainer.loss_fn.log_sigma_occupancy).item() 
                 sigma_imp = torch.exp(trainer.loss_fn.log_sigma_impedance).item()
                 
+                # KL per dimension diagnostics
+                kl_stats = trainer.kl_per_dimension_stats(heatmap_sample, max_impedance_std_sample, 
+                                                          occupancy_sample, impedance_sample)
+                
                 logger.info(f"Epoch {epoch+1} diagnostics:")
                 logger.info(f"  Latent space - μ: {mu_mean:.4f}±{mu_std:.4f}, log(σ²): {logvar_mean:.4f}, σ: {sigma_mean:.4f}")
                 logger.info(f"  Uncertainties - σ_hm: {sigma_hm:.4f}, σ_occ: {sigma_occ:.4f}, σ_imp: {sigma_imp:.4f}")
+                logger.info(f"  KL per dimension - mean: {kl_stats['kl_dim_mean']:.4f}, std: {kl_stats['kl_dim_std']:.4f}")
+                logger.info(f"  KL per dimension - min: {kl_stats['kl_dim_min']:.4f}, max: {kl_stats['kl_dim_max']:.4f}")
+                logger.info(f"  Active dimensions: {kl_stats['kl_active_dims']}/{trainer.model.latent_dim} ({kl_stats['kl_active_ratio']:.1%})")
+                logger.info(f"  Collapsed dimensions (KL < 0.01): {kl_stats['kl_collapsed_dims']}")
+                
+                # Warning if too many dimensions collapsed
+                if kl_stats['kl_active_ratio'] < 0.5:
+                    logger.info(f"  ⚠️  WARNING: Over 50% of latent dimensions collapsed - consider stronger KL weight")
                 
                 # Uncertainty interpretation
                 uncertainties = {'heatmap': sigma_hm, 'occupancy': sigma_occ, 'impedance': sigma_imp}
@@ -568,26 +534,14 @@ def train_vae(config: Optional[TrainingConfig] = None, **overrides):
                 elif abs(mu_mean) > 3.0 or mu_std > 3.0:
                     logger.info("⚠️  WARNING: Latent values very large - may need to reduce KL weight")
 
-        if GAMMA_MONITORING_AVAILABLE and (epoch + 1) % 10 == 0:
-            log_gamma_values(trainer.model, epoch=epoch + 1)
+
 
     logger.plot()
     logger.plot_loss_components()
     logger.print_statistics()
 
-    if GAMMA_MONITORING_AVAILABLE:
-        logger.info("\n" + "=" * 80)
-        logger.info("FINAL ATTENTION GAMMA VALUES")
-        logger.info("=" * 80)
-        log_gamma_values(trainer.model, epoch=cfg.num_epochs)
 
-        active_count = sum(
-            1 for name, param in trainer.model.named_parameters()
-            if 'gamma' in name and abs(param.item()) > 0.1
-        )
-        total_count = sum(1 for name, _ in trainer.model.named_parameters() if 'gamma' in name)
 
-        logger.log_gamma_summary(active_count, total_count)    
     # Log final uncertainty parameters
     logger.info("\n" + "="*80)
     logger.info("FINAL UNCERTAINTY PARAMETERS (KENDALL ET AL.)")
