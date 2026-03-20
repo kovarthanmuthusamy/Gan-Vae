@@ -42,12 +42,12 @@ from Data_Creation.csv_to_occupancy import visualize_occupancy_vector
 # ============================================================
 
 # --- Model Configuration ---
-CHECKPOINT_PATH = "experiments/exp020/checkpoints/checkpoint_epoch_300.pt"  # Path to trained model checkpoint
-MODEL_LATENT_DIM = 132          # Latent dimension (must match training)
+CHECKPOINT_PATH = "experiments/exp018/checkpoints/checkpoint_epoch_200.pt"  # Path to trained model checkpoint
+MODEL_LATENT_DIM = 160          # Latent dimension (must match training)
 
 # --- Generation Configuration ---
 NUM_SAMPLES = 20               # Number of samples to generate
-OUTPUT_DIR = "experiments/exp020/visuals_3"  # Directory to save outputs
+OUTPUT_DIR = "experiments/exp018/visuals"  # Directory to save outputs
 SAVE_DATA = True                # Save raw .npy data files
 SAVE_PLOTS = True               # Save visualization plots
 
@@ -83,20 +83,18 @@ class VAEInference:
         
         # Extract values for denormalization
         print(f"Using {stat_type} stats for normalization")
+        self.max_value_min = norm_stats["Max_value"][f"{stat_type}_min"]
+        self.max_value_max = norm_stats["Max_value"][f"{stat_type}_max"]
         self.imp_log_mean = norm_stats["Impedance"]["log_mean"]
         self.imp_log_std = norm_stats["Impedance"]["log_std"]
-        self.hm_log_mean = norm_stats["Heatmap"]["log_mean"]
-        self.hm_log_std = norm_stats["Heatmap"]["log_std"]
-        self.background_value = norm_stats.get("background_value", -3.6228)
         
-        # Load frequency data, target impedance, and spatial board mask for visualization
+        # Load frequency data and target impedance for visualization
         self.frequency = np.load(PROJECT_ROOT / 'configs/Frequency_data_hz.npy').squeeze()
         self.target_impedance = np.load(PROJECT_ROOT / 'configs/target_impedance.npy').squeeze()
-        self.binary_mask = np.load(PROJECT_ROOT / 'configs/binary_mask.npy')  # (64, 64) bool
         
         print(f"Normalization ranges:")
+        print(f"  Max value: [{self.max_value_min:.4f}, {self.max_value_max:.4f}]")
         print(f"  Impedance (log): mean={self.imp_log_mean:.4f}, std={self.imp_log_std:.4f}")
-        print(f"  Heatmap (log1p): mean={self.hm_log_mean:.4f}, std={self.hm_log_std:.4f}")
         
         # Load model
         print(f"\nLoading checkpoint from: {checkpoint_path}")
@@ -152,7 +150,7 @@ class VAEInference:
         with torch.no_grad():
             # Use the model's inference method which correctly handles
             # the hybrid latent space (Gaussian + Gumbel-Softmax for occupancy)
-            heatmap_zscore, occupancy, impedance_norm = self.model.inference(
+            heatmap_norm, occupancy, impedance_norm, max_impedance_norm = self.model.inference(
                 num_samples, self.device, latent_stats=self.latent_stats
             )
             
@@ -160,35 +158,36 @@ class VAEInference:
             # Apply threshold to create binary occupancy map
             occupancy_binary = (occupancy >= 0.5).float()
             
+            # Denormalize max_impedance from [0, 1] to original range
+            max_impedance_denorm = max_impedance_norm * (self.max_value_max - self.max_value_min) + self.max_value_min
+            
             # Denormalize impedance from z-score to log scale
             impedance_denorm = impedance_norm * self.imp_log_std + self.imp_log_mean
             
-            # Post-process heatmap: stamp sentinel on background using occupancy
-            # Occupancy tells us which regions are foreground
-            # For now, use the raw decoder output for foreground, sentinel for background
-            # (The model was trained with masked loss — it never learned to predict background)
-            
-            # Denormalize heatmap from z-score to raw: z-score → log(1+x) → x
-            heatmap_log = heatmap_zscore * self.hm_log_std + self.hm_log_mean
-            heatmap_physical = torch.exp(heatmap_log) - 1.0
-            heatmap_physical = torch.clamp(heatmap_physical, min=0.0)
+            # Denormalize heatmap ch0 using min-max formula: x_raw = x_norm * (x_max - x_min) + x_min
+            # Heatmap ch0 was normalized per-sample as x_norm = x_raw / per_sample_max, so x_min = 0
+            heatmap_ch0_min = 0.0
+            max_imp = max_impedance_denorm.view(-1, 1, 1, 1)
+            heatmap_physical = heatmap_norm * (max_imp - heatmap_ch0_min) + heatmap_ch0_min
             
         output_path = Path(out_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
         # Move to CPU for saving
-        heatmap_zscore_cpu = heatmap_zscore.cpu().numpy()
+        heatmap_norm_cpu = heatmap_norm.cpu().numpy()
         heatmap_physical_cpu = heatmap_physical.cpu().numpy()
+        max_impedance_cpu = max_impedance_denorm.cpu().numpy()
         occupancy_cpu = occupancy_binary.cpu().numpy()  # Use binary occupancy
         impedance_cpu = impedance_denorm.cpu().numpy()
         
         print(f"\nGenerated shapes:")
-        print(f"  Heatmap (z-score): {heatmap_zscore_cpu.shape}")
+        print(f"  Heatmap (normalized): {heatmap_norm_cpu.shape}")
         print(f"  Heatmap (physical/denormalized): {heatmap_physical_cpu.shape}")
+        print(f"  Max Impedance (denormalized): {max_impedance_cpu.shape}")
         print(f"  Occupancy: {occupancy_cpu.shape}")
         print(f"  Impedance (denormalized, log scale): {impedance_cpu.shape}")
         print(f"\nDenormalized value ranges:")
-        print(f"  Heatmap: [{heatmap_physical_cpu.min():.4f}, {heatmap_physical_cpu.max():.4f}]")
+        print(f"  Max Impedance: [{max_impedance_cpu.min():.4f}, {max_impedance_cpu.max():.4f}]")
         print(f"  Impedance (log): [{impedance_cpu.min():.4f}, {impedance_cpu.max():.4f}]")
         
         # Save raw data
@@ -198,13 +197,14 @@ class VAEInference:
             data_dir.mkdir(exist_ok=True)
             
             # Save both normalized and denormalized outputs
-            np.save(data_dir / f"heatmap_zscore.npy", heatmap_zscore_cpu[i])
+            np.save(data_dir / f"heatmap_norm.npy", heatmap_norm_cpu[i])
             np.save(data_dir / f"heatmap_physical.npy", heatmap_physical_cpu[i])  # Denormalized
+            np.save(data_dir / f"max_impedance.npy", max_impedance_cpu[i])  # Denormalized
             np.save(data_dir / f"occupancy_map.npy", occupancy_cpu[i])
             np.save(data_dir / f"impedance_profile.npy", impedance_cpu[i])  # Denormalized (log scale)
             
             print(f"\nSaved sample {i} data to: {data_dir}")
-            print(f"  Heatmap physical range: [{heatmap_physical_cpu[i].min():.4f}, {heatmap_physical_cpu[i].max():.4f}]")
+            print(f"  Max impedance (denorm): {max_impedance_cpu[i].item():.4f}")
             print(f"  Impedance log range: [{impedance_cpu[i].min():.4f}, {impedance_cpu[i].max():.4f}]")
             
             # Generate visualization
@@ -212,18 +212,20 @@ class VAEInference:
                 heatmap_physical=heatmap_physical_cpu[i],
                 impedance_log=impedance_cpu[i],
                 occupancy=occupancy_cpu[i],
+                max_value=max_impedance_cpu[i].item(),
                 sample_idx=i,
                 output_dir=data_dir
             )
     
-    def visualize_sample(self, heatmap_physical, impedance_log, occupancy, sample_idx, output_dir):
+    def visualize_sample(self, heatmap_physical, impedance_log, occupancy, max_value, sample_idx, output_dir):
         """
         Visualize generated sample with subplots for heatmap, impedance, and occupancy
         
         Args:
-            heatmap_physical: Denormalized physical heatmap (1, 64, 64)
+            heatmap_physical: Denormalized physical heatmap (2, 64, 64)
             impedance_log: Denormalized impedance in log scale (231,)
             occupancy: Occupancy vector (52,) or compatible shape
+            max_value: Denormalized max impedance value (scalar)
             sample_idx: Sample index for title
             output_dir: Directory to save visualization
         """
@@ -232,13 +234,10 @@ class VAEInference:
         
         # Subplot 1: Heatmap (Channel 0 - impedance channel)
         ax1 = plt.subplot(1, 3, 1)
-        heatmap_ch0 = heatmap_physical[0]  # Extract channel 0 (1, 64, 64) -> (64, 64)
-        # Apply spatial board mask: background pixels are masked and shown as white
-        heatmap_masked = np.ma.masked_where(~self.binary_mask, heatmap_ch0)
-        cmap_22 = mpl.colormaps['jet'].resampled(22).copy()
-        cmap_22.set_bad(color='white')
+        heatmap_ch0 = heatmap_physical[0]  # Extract channel 0
+        cmap_22 = mpl.colormaps['jet'].resampled(22)
         im1 = ax1.imshow(
-            heatmap_masked,
+            heatmap_ch0,
             cmap=cmap_22,
             interpolation='bicubic',
             aspect='auto',
@@ -248,6 +247,11 @@ class VAEInference:
         ax1.set_xlabel('X', fontsize=12)
         ax1.set_ylabel('Y', fontsize=12)
         plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        # Display max_value (denormalized) on the heatmap
+        ax1.text(0.98, 0.02, f'Max Value (denorm): {max_value:.4f}', 
+                 transform=ax1.transAxes, fontsize=11, 
+                 verticalalignment='bottom', horizontalalignment='right',
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         # Subplot 2: Impedance Profile
         ax2 = plt.subplot(1, 3, 2)
@@ -281,8 +285,7 @@ class VAEInference:
         output_path = Path(output_dir) / f'visualization_sample_{sample_idx}.png'
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         print(f"  Visualization saved: {output_path}")
-        plt.show(block=False)
-        plt.pause(0.001)
+        plt.show()  # Display the plot
         plt.close(fig)
   
 

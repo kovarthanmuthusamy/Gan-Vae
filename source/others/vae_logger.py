@@ -92,7 +92,7 @@ class VAETrainingLogger:
         
         # Console output
         print(f"Ep {epoch:3d} | Total: {total_loss:8.4f} | Recon: {recon_loss:8.4f} | KL: {kl_loss:8.4f} | "
-              f"HM: {heatmap_loss:8.4f} | MaxImp: {max_impedance_loss:7.4f} | OC: {occupancy_loss:8.4f} | IMP: {impedance_loss:8.4f}")
+              f"HM: {heatmap_loss:8.4f} | OC: {occupancy_loss:8.4f} | IMP: {impedance_loss:8.4f}")
     
     def log_dict(self, epoch: int, loss_dict: dict):
         """
@@ -368,7 +368,7 @@ if __name__ == "__main__":
         impedance_loss = 3.0 - epoch * 0.1
         
         logger.log(epoch, total_loss, recon_loss, kl_loss, 
-                  heatmap_loss, occupancy_loss, impedance_loss)
+                  heatmap_loss, occupancy_loss, impedance_loss) # type: ignore
     
     # Generate plots
     logger.plot()

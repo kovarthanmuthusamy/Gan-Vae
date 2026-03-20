@@ -4,9 +4,6 @@ Streamlined version without complex features
 """
 
 import sys
-import csv
-import json
-import random
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -30,59 +27,52 @@ from source.others.vae_logger import VAETrainingLogger
 # ============================================================
 class Config:
     # Model
-    latent_dim: int = 132  # Total latent dim (private + shared)
+    latent_dim: int = 160  # Total latent dim (private + shared)
     
     # Training
-    num_epochs: int = 300
+    num_epochs: int = 200
     batch_size: int = 64
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-5
     
     # Loss weights
     heatmap_weight: float = 1.0
     occupancy_weight: float = 1.0
-    impedance_weight: float = 1.0
-
-    # Cross-modal reconstruction weight (trains shared space for cross-modal generation)
-    # Each batch: randomly pick one source modality, encode it alone, decode all outputs.
-    # Set to 0.0 to disable (reverts to standard ELBO-only training).
-    cross_modal_weight: float = 0.5
-
-    # Modality dropout: probability of dropping each modality from the shared PoE during training.
-    # Forces each single modality to independently populate the shared space (enables cross-modal gen).
-    modality_dropout: float = 0.3
+    impedance_weight: float = 0.5
+    maxvalue_weight: float = 0.1
     
     # Gumbel-Softmax temperature annealing for occupancy
     gumbel_temp_start: float = 1.0    # Start warm (soft samples)
     gumbel_temp_end: float = 0.1      # Anneal to cold (hard samples)
-    gumbel_anneal_epochs: int = 150   # Anneal over this many epochs (slow to preserve gradients)
+    gumbel_anneal_epochs: int = 100   # Anneal over this many epochs
     
     
-    # Free bits: minimum KL per latent dimension (prevents posterior collapse as β rises)
-    free_bits: float = 0.5  # nats; dims below this KL are not penalised
-
+    # Free bits: minimum KL per latent dimension (prevents private-space collapse)
+    free_bits: float = 0.5  # nats per dim; 0 = disabled, 0.25-1.0 typical
+    
     # Beta-VAE Annealing (KL weight annealing)
     use_beta_annealing: bool = True  # Set to True to enable beta annealing
     beta_start_epoch: int = 0        # Start annealing from epoch 0
-    beta_end_epoch: int = 200        # Ramp up over 200 epochs
+    beta_end_epoch: int = 100         # Ramp up over 100 epochs
     beta_initial: float = 0.0        # Start with 0 KL weight
-    beta_final: float = 0.01        # Ramp to final KL weight — enough to pull μ toward 0 for valid N(0,1) sampling
+    beta_final: float = 0.0005       # Ramp to final KL weight (same as beta_weight for fixed KL)
     
     # Data
     data_dir: str = "datasets/data_norm"
     train_split: float = 0.9
     num_workers: int = 4
     
-    # Background sentinel (loaded from normalization stats at runtime)
-    background_value: float = -3.6228  # default; overridden in train_vae()
-    
     # Checkpoints
 
-    experiment_dir: str = "experiments/exp020"  # Directory to save checkpoints and logs
+    experiment_dir: str = "experiments/exp018"  # Directory to save checkpoints and logs
     checkpoint_interval: int = 10
-    resume_checkpoint: str = ""  
+    resume_checkpoint: str = ""#"experiments/exp018/checkpoints/checkpoint_epoch_100.pt"  # Architecture changed (Gumbel-Softmax) — old checkpoints incompatible
     
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # max value denormalization — must match datasets/data_norm normalization_stats.json (p0.1/p99.9)
+    max_value_min: float = 1.5898871421813965
+    max_value_max: float = 10.52902603149414
 
 
 
@@ -159,58 +149,89 @@ def compute_beta(epoch, config):
 # ============================================================
 # LOSS FUNCTION
 # ============================================================
-def vae_loss(recon_heatmap, recon_occupancy, recon_impedance,
-             target_heatmap, target_occupancy, target_impedance,
+def vae_loss(recon_heatmap, recon_occupancy, recon_impedance, recon_maxvalue,
+             target_heatmap, target_occupancy, target_impedance, target_maxvalue,
              mu_gaussian, logvar_gaussian, occ_logits, beta, config):
     """
     Hybrid VAE loss: Reconstruction + Gaussian KL + Gumbel KL
     
     Args:
-        mu_gaussian, logvar_gaussian: Gaussian parts (heatmap, impedance privates + shared)
+        mu_gaussian, logvar_gaussian: Gaussian parts (heatmap, impedance, maxvalue privates + shared)
         occ_logits: (B, occ_priv, 2) Gumbel-Softmax logits for occupancy
         beta: Annealed KL weight
     """
-    # Heatmap loss (foreground-masked: exclude background sentinel pixels)
-    # Sentinel = config.background_value (z-score of log(1+0) ≈ -3.62); foreground z_min ≈ -2.12
-    fg_mask = (target_heatmap > config.background_value + 0.5).float()  # 1=foreground, 0=background
-    huber_elem = F.huber_loss(recon_heatmap, target_heatmap, delta=0.5, reduction='none')
-    fg_count = fg_mask.sum().clamp(min=1.0)
-    loss_heatmap = (huber_elem * fg_mask).sum() / fg_count
+    # combined los for max_value and heatmap: MSE on denormalized values (emphasizes peaks more)
+    max_value_min = config.max_value_min
+    max_value_max = config.max_value_max
+    # Denorm max_value: percentile min-max → raw scale factor (per-sample)
+    max_imp_denorm   = (target_maxvalue * (max_value_max - max_value_min) + max_value_min).view(-1, 1, 1)
+    max_imp_denorm_p = (recon_maxvalue  * (max_value_max - max_value_min) + max_value_min).view(-1, 1, 1)
 
-    # Occupancy loss: binary cross-entropy
+    # Channel 0: min-max denorm then MSE — x_raw = x_norm * (x_max - x_min) + x_min
+    # Heatmap ch0 was normalized per-sample as x_norm = x_raw / per_sample_max, so x_min = 0, x_max = max_imp_denorm
+    heatmap_ch0_min = 0.0
+    loss_heatmap_ch0 = F.mse_loss(
+        recon_heatmap[:, 0] * (max_imp_denorm_p - heatmap_ch0_min) + heatmap_ch0_min,
+        target_heatmap[:, 0] * (max_imp_denorm   - heatmap_ch0_min) + heatmap_ch0_min,
+        reduction='mean'
+    )
+    # Channel 1: constant binary mask — apply separately so it doesn't dilute ch0 gradients
+    loss_heatmap_ch1 = F.mse_loss(recon_heatmap[:, 1], target_heatmap[:, 1], reduction='mean')
+    loss_heatmap = loss_heatmap_ch0 + loss_heatmap_ch1
+
+    #occupancy loss: binary cross-entropy with logits (numerically stable)
     loss_occupancy = F.binary_cross_entropy(
         recon_occupancy.clamp(1e-7, 1 - 1e-7),
         target_occupancy.clamp(0.0, 1.0),
         reduction='mean'
     )
+    
+    # Peak-sensitive impedance loss: weight peaks 10x more than flat regions
+    # Compute per-point error (delta=0.4 scaled for z-score clip range ~[-2.6, +2.1])
+    imp_error = F.huber_loss(recon_impedance, target_impedance, delta=0.4, reduction='none')  # (B, 231)
+    # Detect peaks: how much each point deviates from sample mean (global, not local)
+    with torch.no_grad():
+        imp_mean = target_impedance.mean(dim=1, keepdim=True)  # (B, 1)
+        deviation = (target_impedance - imp_mean).abs()  # (B, 231)
+        # Normalize deviation to [0, 1] per sample, then scale: flat=1x, peaks=10x
+        dev_max = deviation.max(dim=1, keepdim=True).values.clamp(min=1e-8)
+        peak_weight = 1.0 + 9.0 * (deviation / dev_max)  # (B, 231), range [1, 10]
+    loss_impedance_recon = (imp_error * peak_weight).mean() * 5
 
-    loss_impedance = F.huber_loss(recon_impedance, target_impedance, delta=0.5, reduction='mean')
+    # Smoothness loss: penalize differences between adjacent frequency points
+    # Forces generated curve slopes to match target slopes, suppressing noise/jaggedness
+    recon_diff = recon_impedance[:, 1:] - recon_impedance[:, :-1]     # (B, 230)
+    target_diff = target_impedance[:, 1:] - target_impedance[:, :-1]  # (B, 230)
+    loss_impedance_smooth = F.mse_loss(recon_diff, target_diff)
 
+    loss_impedance = loss_impedance_recon + 2.0 * loss_impedance_smooth
+        
     # Total reconstruction loss (weighted)
     recon_loss = (config.heatmap_weight * loss_heatmap +
                   config.occupancy_weight * loss_occupancy +
-                  config.impedance_weight * loss_impedance)
+                  config.impedance_weight * loss_impedance )
     
-    # === Gaussian KL divergence ===
+    # === Gaussian KL divergence with free bits (prevents private-space collapse) ===
     # Per-dim KL: 0.5 * (μ² + σ² - log(σ²) - 1)
     kl_per_dim = -0.5 * (1 + logvar_gaussian - mu_gaussian.pow(2) - logvar_gaussian.exp())  # (B, D)
-    # Free-bits: don't penalise dims whose KL is already below the floor
+    kl_per_dim = kl_per_dim.mean(dim=0)  # (D,) average over batch
     if config.free_bits > 0:
-        kl_per_dim = torch.clamp(kl_per_dim, min=config.free_bits)
-    kl_gaussian = kl_per_dim.mean()  # mean over batch and dims
+        kl_per_dim = torch.clamp(kl_per_dim, min=config.free_bits)  # floor at λ nats
+    kl_gaussian = kl_per_dim.sum()
     
-    # === Binary Concrete KL divergence (for occupancy) ===
-    # KL(Bernoulli(q) || Bernoulli(0.5)) per dim
-    # = q * log(q/0.5) + (1-q) * log((1-q)/0.5)
-    # = q*log(q) + (1-q)*log(1-q) + log(2)  [since prior is 0.5]
-    occ_probs = torch.sigmoid(occ_logits)  # (B, occ_priv)
-    occ_probs = occ_probs.clamp(1e-6, 1 - 1e-6)
-    kl_bernoulli = (occ_probs * torch.log(occ_probs / 0.5) +
-                    (1 - occ_probs) * torch.log((1 - occ_probs) / 0.5))  # (B, occ_priv)
-    kl_bernoulli = kl_bernoulli.mean()  # mean over dims and batch
+    # === Gumbel KL divergence (for occupancy) ===
+    # KL(q(z|x) || Uniform(0.5, 0.5))
+    # = Σ_i Σ_k q_ik * log(q_ik / p_k)  where p_k = 0.5
+    # = Σ_i Σ_k q_ik * (log(q_ik) + log(2))
+    occ_probs = F.softmax(occ_logits, dim=-1)  # (B, occ_priv, 2)
+    log_probs = torch.log(occ_probs + 1e-8)
+    # KL from uniform prior: each category has prior prob 0.5
+    log_prior = torch.log(torch.tensor(0.5, device=occ_logits.device))
+    kl_gumbel = (occ_probs * (log_probs - log_prior)).sum(dim=-1).sum(dim=-1)  # (B,)
+    kl_gumbel = kl_gumbel.mean()  # Average over batch
     
     # Total KL
-    kl_loss = kl_gaussian + kl_bernoulli
+    kl_loss = kl_gaussian + kl_gumbel
     
     # Total loss
     total_loss = recon_loss + beta * kl_loss
@@ -220,7 +241,7 @@ def vae_loss(recon_heatmap, recon_occupancy, recon_impedance,
         'recon_loss': recon_loss,
         'kl_loss': kl_loss,
         'kl_gaussian': kl_gaussian,
-        'kl_bernoulli': kl_bernoulli,
+        'kl_gumbel': kl_gumbel,
         'heatmap_loss': loss_heatmap,
         'occupancy_loss': loss_occupancy,
         'impedance_loss': loss_impedance
@@ -231,10 +252,10 @@ def vae_loss(recon_heatmap, recon_occupancy, recon_impedance,
 # TRAINING FUNCTIONS
 # ============================================================
 def train_epoch(model, train_loader, optimizer, config, epoch, beta, temperature):
-    """Train for one epoch with annealed beta and Binary Concrete temperature"""
+    """Train for one epoch with annealed beta and Gumbel temperature"""
     model.train()
     total_losses = {'total_loss': 0.0, 'recon_loss': 0.0, 'kl_loss': 0.0,
-                   'kl_gaussian': 0.0, 'kl_bernoulli': 0.0,
+                   'kl_gaussian': 0.0, 'kl_gumbel': 0.0,
                    'heatmap_loss': 0.0, 'occupancy_loss': 0.0, 
                    'impedance_loss': 0.0,  'beta': beta}
     
@@ -246,9 +267,9 @@ def train_epoch(model, train_loader, optimizer, config, epoch, beta, temperature
     # Track per-modality private stats
     modality_stats = {
         'heatmap':   {'mu_mean': 0.0, 'mu_std': 0.0, 'std_mean': 0.0, 'std_std': 0.0},
-        'occupancy': {'prob1_mean': 0.0, 'prob1_std': 0.0,
-                     'logit_mag': 0.0, 'entropy': 0.0, 'sharp_frac': 0.0},  # Gumbel stats
+        'occupancy': {'prob1_mean': 0.0, 'prob1_std': 0.0},  # Gumbel: track P(1) 
         'impedance': {'mu_mean': 0.0, 'mu_std': 0.0, 'std_mean': 0.0, 'std_std': 0.0},
+        'maxvalue':  {'mu_mean': 0.0, 'mu_std': 0.0, 'std_mean': 0.0, 'std_std': 0.0}
     }
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} (β={beta:.5f}, τ={temperature:.3f})")
@@ -257,27 +278,25 @@ def train_epoch(model, train_loader, optimizer, config, epoch, beta, temperature
         heatmap = batch['heatmap_norm'].to(config.device)
         occupancy = batch['occupancy'].to(config.device)
         impedance = batch['impedance'].to(config.device)
+        maxvalue = batch['max_impedance_std'].to(config.device)
         
         # Ensure correct shapes
         if heatmap.dim() == 3:
             heatmap = heatmap.unsqueeze(1)
         if impedance.dim() == 1:
             impedance = impedance.unsqueeze(0)
+        if maxvalue.dim() == 1:
+            maxvalue = maxvalue.unsqueeze(1)
         
-        # Replace background sentinel with 0 (z-score mean) for encoder input.
-        # Sentinel (-3.62) is ~20σ outside foreground range and pollutes encoder activations.
-        # Loss masking uses the original heatmap, so reconstruction targets are unaffected.
-        heatmap_enc = heatmap.masked_fill(heatmap < config.background_value + 0.5, 0.0)
-
         # Forward pass
         optimizer.zero_grad()
-        recon_hm, recon_occ, recon_imp, mu_gaussian, logvar_gaussian, occ_logits, mod_stats = model(
-            heatmap_enc, occupancy, impedance, temperature=temperature
+        recon_hm, recon_occ, recon_imp, recon_mv, mu_gaussian, logvar_gaussian, occ_logits, mod_stats = model(
+            heatmap, occupancy, impedance, maxvalue, temperature=temperature
         )
         
         # Compute loss with annealed beta (hybrid: Gaussian KL + Gumbel KL)
-        losses = vae_loss(recon_hm, recon_occ, recon_imp,
-                         heatmap, occupancy, impedance,
+        losses = vae_loss(recon_hm, recon_occ, recon_imp, recon_mv,
+                         heatmap, occupancy, impedance, maxvalue,
                          mu_gaussian, logvar_gaussian, occ_logits, beta, config)
         
         
@@ -300,7 +319,7 @@ def train_epoch(model, train_loader, optimizer, config, epoch, beta, temperature
             std_stats['max'] = max(std_stats['max'], std.max().item())
             
             # Track per-modality private stats
-            for mod_name in ['heatmap', 'impedance']:
+            for mod_name in ['heatmap', 'impedance', 'maxvalue']:
                 mod_mu, mod_logvar = mod_stats[mod_name]
                 mod_std = torch.exp(mod_logvar / 2)
                 modality_stats[mod_name]['mu_mean'] += mod_mu.mean().item()
@@ -308,38 +327,12 @@ def train_epoch(model, train_loader, optimizer, config, epoch, beta, temperature
                 modality_stats[mod_name]['std_mean'] += mod_std.mean().item()
                 modality_stats[mod_name]['std_std'] += mod_std.std().item()
             
-            # Occupancy: track P(bit=1) from Binary Concrete
-            occ_logits_raw, occ_probs = mod_stats['occupancy']  # logits: (B, occ_priv), probs: (B, occ_priv)
-            p1 = occ_probs  # P(bit=1) = sigmoid(logit) per dim
+            # Occupancy: track P(class=1) from Gumbel-Softmax
+            _, occ_probs = mod_stats['occupancy']  # (B, occ_priv, 2)
+            p1 = occ_probs[:, :, 1]  # P(bit=1) for each dim
             modality_stats['occupancy']['prob1_mean'] += p1.mean().item()
             modality_stats['occupancy']['prob1_std'] += p1.std().item()
-            # Logit magnitude: |logit| — how confident the encoder is
-            modality_stats['occupancy']['logit_mag'] += occ_logits_raw.abs().mean().item()
-            # Binary entropy: -[p*log(p) + (1-p)*log(1-p)], max=ln(2)≈0.693
-            ent = -(p1 * torch.log(p1 + 1e-8) + (1 - p1) * torch.log(1 - p1 + 1e-8))  # (B, occ_priv)
-            modality_stats['occupancy']['entropy'] += ent.mean().item()
-            # Sharp fraction: dims where P(1) > 0.8 or P(1) < 0.2
-            sharp = ((p1 > 0.8) | (p1 < 0.2)).float().mean()
-            modality_stats['occupancy']['sharp_frac'] += sharp.item()
         
-        # Cross-modal reconstruction: encode from one random source modality, decode all outputs.
-        # Provides a direct gradient signal forcing the shared space to carry cross-modal info.
-        # This runs outside torch.no_grad() so gradients flow back through the source encoder.
-        if config.cross_modal_weight > 0:
-            source = random.choice(['heatmap', 'impedance'])
-            z_cm = model.encode_cross_modal(
-                source, heatmap=heatmap_enc, impedance=impedance, temperature=temperature
-            )
-            recon_hm_cm, recon_occ_cm, recon_imp_cm = model.decode(z_cm)
-            fg_mask_cm = (heatmap > config.background_value + 0.5).float()
-            loss_hm_cm  = (F.huber_loss(recon_hm_cm, heatmap, delta=1.0, reduction='none') * fg_mask_cm).sum() / fg_mask_cm.sum().clamp(min=1.0)
-            loss_occ_cm = F.binary_cross_entropy(recon_occ_cm.clamp(1e-7, 1-1e-7), occupancy.clamp(0, 1), reduction='mean')
-            loss_imp_cm = F.huber_loss(recon_imp_cm, impedance, delta=5.0, reduction='mean')
-            loss_cm = (config.heatmap_weight * loss_hm_cm +
-                       config.occupancy_weight * loss_occ_cm +
-                       config.impedance_weight * loss_imp_cm)
-            losses['total_loss'] = losses['total_loss'] + config.cross_modal_weight * loss_cm
-
         # Backward pass
         losses['total_loss'].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -370,7 +363,7 @@ def train_epoch(model, train_loader, optimizer, config, epoch, beta, temperature
     logvar_stats['std'] /= num_batches
     
     # Average modality stats
-    for mod_name in ['heatmap', 'impedance']:
+    for mod_name in ['heatmap', 'impedance', 'maxvalue']:
         for key in modality_stats[mod_name]:
             modality_stats[mod_name][key] /= num_batches
     modality_stats['occupancy']['prob1_mean'] /= num_batches
@@ -394,7 +387,7 @@ def validate(model, val_loader, config, beta, temperature):
     """Validate the model with current beta and temperature"""
     model.eval()
     total_losses = {'total_loss': 0.0, 'recon_loss': 0.0, 'kl_loss': 0.0,
-                   'kl_gaussian': 0.0, 'kl_bernoulli': 0.0,
+                   'kl_gaussian': 0.0, 'kl_gumbel': 0.0,
                    'heatmap_loss': 0.0, 'occupancy_loss': 0.0, 
                    'impedance_loss': 0.0,  'beta': beta}
     
@@ -406,9 +399,9 @@ def validate(model, val_loader, config, beta, temperature):
     # Track per-modality private stats
     modality_stats = {
         'heatmap':   {'mu_mean': 0.0, 'mu_std': 0.0, 'std_mean': 0.0, 'std_std': 0.0},
-        'occupancy': {'prob1_mean': 0.0, 'prob1_std': 0.0,
-                     'logit_mag': 0.0, 'entropy': 0.0, 'sharp_frac': 0.0},
+        'occupancy': {'prob1_mean': 0.0, 'prob1_std': 0.0},
         'impedance': {'mu_mean': 0.0, 'mu_std': 0.0, 'std_mean': 0.0, 'std_std': 0.0},
+        'maxvalue':  {'mu_mean': 0.0, 'mu_std': 0.0, 'std_mean': 0.0, 'std_std': 0.0},
         'shared':    {'mu_mean': 0.0, 'mu_std': 0.0, 'std_mean': 0.0, 'std_std': 0.0}
     }
     
@@ -418,24 +411,24 @@ def validate(model, val_loader, config, beta, temperature):
             heatmap = batch['heatmap_norm'].to(config.device)
             occupancy = batch['occupancy'].to(config.device)
             impedance = batch['impedance'].to(config.device)
+            maxvalue = batch['max_impedance_std'].to(config.device)
             
             # Ensure correct shapes
             if heatmap.dim() == 3:
                 heatmap = heatmap.unsqueeze(1)
             if impedance.dim() == 1:
                 impedance = impedance.unsqueeze(0)
+            if maxvalue.dim() == 1:
+                maxvalue = maxvalue.unsqueeze(1)
             
-            # Replace background sentinel with 0 for encoder input (same as train)
-            heatmap_enc = heatmap.masked_fill(heatmap < config.background_value + 0.5, 0.0)
-
             # Forward pass
-            recon_hm, recon_occ, recon_imp, mu_gaussian, logvar_gaussian, occ_logits, mod_stats = model(
-                heatmap_enc, occupancy, impedance, temperature=temperature
+            recon_hm, recon_occ, recon_imp, recon_mv, mu_gaussian, logvar_gaussian, occ_logits, mod_stats = model(
+                heatmap, occupancy, impedance, maxvalue, temperature=temperature
             )
             
             # Compute loss
-            losses = vae_loss(recon_hm, recon_occ, recon_imp,
-                            heatmap, occupancy, impedance,
+            losses = vae_loss(recon_hm, recon_occ, recon_imp, recon_mv,
+                            heatmap, occupancy, impedance, maxvalue,
                             mu_gaussian, logvar_gaussian, occ_logits, beta, config)
             
             # Track mu and logvar statistics (Gaussian parts only)
@@ -456,7 +449,7 @@ def validate(model, val_loader, config, beta, temperature):
             std_stats['max'] = max(std_stats['max'], std.max().item())
             
             # Track per-modality private stats
-            for mod_name in ['heatmap', 'impedance']:
+            for mod_name in ['heatmap', 'impedance', 'maxvalue']:
                 mod_mu, mod_logvar = mod_stats[mod_name]
                 mod_std = torch.exp(mod_logvar / 2)
                 modality_stats[mod_name]['mu_mean'] += mod_mu.mean().item()
@@ -474,19 +467,11 @@ def validate(model, val_loader, config, beta, temperature):
             modality_stats['shared']['std_mean'] += shared_std.mean().item()
             modality_stats['shared']['std_std'] += shared_std.std().item()
             
-            # Occupancy: track P(bit=1) from Binary Concrete
-            occ_logits_raw, occ_probs = mod_stats['occupancy']
-            p1 = occ_probs  # (B, occ_priv)
+            # Occupancy: track P(class=1) from Gumbel-Softmax
+            _, occ_probs = mod_stats['occupancy']
+            p1 = occ_probs[:, :, 1]
             modality_stats['occupancy']['prob1_mean'] += p1.mean().item()
             modality_stats['occupancy']['prob1_std'] += p1.std().item()
-            # Logit magnitude
-            modality_stats['occupancy']['logit_mag'] += occ_logits_raw.abs().mean().item()
-            # Binary entropy
-            ent = -(p1 * torch.log(p1 + 1e-8) + (1 - p1) * torch.log(1 - p1 + 1e-8))
-            modality_stats['occupancy']['entropy'] += ent.mean().item()
-            # Sharp fraction
-            sharp = ((p1 > 0.8) | (p1 < 0.2)).float().mean()
-            modality_stats['occupancy']['sharp_frac'] += sharp.item()
             
             # Accumulate losses (skip beta as it's constant)
             for key in total_losses:
@@ -545,7 +530,6 @@ def train_vae():
     checkpoint_path.mkdir(exist_ok=True)
     log_path = exp_path / "logs"
     log_path.mkdir(exist_ok=True)
-    latent_stats_csv = log_path / "latent_stats.csv"
     
     # Initialize logger
     logger = VAETrainingLogger(log_dir=str(log_path), checkpoint_dir=str(checkpoint_path))
@@ -555,22 +539,17 @@ def train_vae():
     print("="*80)
     print(f"Device: {config.device}")
     print(f"Experiment: {config.experiment_dir}")
+    print(f"Logs: {log_path}")
+    print(f"Checkpoints: {checkpoint_path}")
     print(f"Latent dim: {config.latent_dim}")
     print(f"Batch size: {config.batch_size}")
     print(f"Learning rate: {config.learning_rate}")
     if config.use_beta_annealing:
-        print(f"Beta: {config.beta_initial} → {config.beta_final} over epochs {config.beta_start_epoch}-{config.beta_end_epoch}")
-    print(f"Gumbel temp: {config.gumbel_temp_start} → {config.gumbel_temp_end} over {config.gumbel_anneal_epochs} epochs")
+        print(f"Beta Annealing: {config.beta_initial} → {config.beta_final} over epochs {config.beta_start_epoch}-{config.beta_end_epoch}")
     print("="*80)
     
-    # Load background sentinel from normalization stats
-    stats_path = Path(config.data_dir) / "normalization_stats.json"
-    if stats_path.exists():
-        with open(stats_path, 'r') as f:
-            norm_stats = json.load(f)
-        config.background_value = norm_stats["background_value"]
-    
     # Create data loaders
+    print("\nLoading data...")
     train_loader, val_loader = create_data_loaders(
         data_dir=config.data_dir,
         batch_size=config.batch_size,
@@ -579,11 +558,18 @@ def train_vae():
         train_split=config.train_split,
         seed=42
     )
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Val batches: {len(val_loader)}")
     
     # Create model
-    model = MultiInputVAE(latent_dim=config.latent_dim, modality_dropout=config.modality_dropout).to(config.device)
+    print("\nInitializing model...")
+    model = MultiInputVAE(latent_dim=config.latent_dim).to(config.device)
+    
+    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {total_params:,}")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
     
     # Create optimizer
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -603,10 +589,14 @@ def train_vae():
                 config.device
             )
         else:
-            print(f"\n⚠️  Checkpoint not found: {config.resume_checkpoint}, starting from scratch")
+            print(f"\n⚠️  WARNING: Checkpoint not found: {config.resume_checkpoint}")
+            print("Starting training from scratch...\n")
+    else:
+        print("\nStarting training from scratch...")
     
     # Training loop
-    print(f"\nTraining epochs {start_epoch + 1}–{config.num_epochs}...")
+    print(f"\nTraining from epoch {start_epoch + 1} to {config.num_epochs}...")
+    print(f"Gumbel temperature: {config.gumbel_temp_start} → {config.gumbel_temp_end} over {config.gumbel_anneal_epochs} epochs")
     
     for epoch in range(start_epoch, config.num_epochs):
         # Compute annealed beta for this epoch
@@ -631,7 +621,7 @@ def train_vae():
             'recon_loss': train_losses['recon_loss'],
             'kl_loss': train_losses['kl_loss'],
             'kl_gaussian': train_losses['kl_gaussian'],
-            'kl_bernoulli': train_losses['kl_bernoulli'],
+            'kl_gumbel': train_losses['kl_gumbel'],
             'heatmap_loss': train_losses['heatmap_loss'],
             'occupancy_loss': train_losses['occupancy_loss'],
             'impedance_loss': train_losses['impedance_loss']
@@ -641,62 +631,26 @@ def train_vae():
         logger.log_dict(epoch=epoch+1, loss_dict=train_loss_dict)
         
         # Print validation summary
-        print(f"  Val - Loss: {val_losses['total_loss']:.4f} "
-              f"(recon={val_losses['recon_loss']:.4f}, "
-              f"kl={val_losses['kl_loss']:.4f})")
+        print(f"  Val   - Total: {val_losses['total_loss']:.4f}, "
+              f"Recon: {val_losses['recon_loss']:.4f}, "
+              f"KL: {val_losses['kl_loss']:.4f} "
+              f"(gauss={val_losses['kl_gaussian']:.4f}, gumbel={val_losses['kl_gumbel']:.4f})")
         
-        # Print per-modality latent stats
+        # Print latent space statistics
         v_ms = val_losses['modality_stats']
-        print(f"  Latent μ/σ - "
-              f"hm: {v_ms['heatmap']['mu_mean']:.3f}/{v_ms['heatmap']['std_mean']:.3f}, "
-              f"occ P(1): {v_ms['occupancy']['prob1_mean']:.3f}, "
-              f"imp: {v_ms['impedance']['mu_mean']:.3f}/{v_ms['impedance']['std_mean']:.3f}, "
-              f"shared: {v_ms['shared']['mu_mean']:.3f}/{v_ms['shared']['std_mean']:.3f}")
-        # Print Gumbel-Softmax diagnostics
-        occ_s = v_ms['occupancy']
-        print(f"  Gumbel - logit_mag: {occ_s.get('logit_mag', 0):.3f}, "
-              f"entropy: {occ_s.get('entropy', 0):.3f}/0.693, "
-              f"sharp%%: {occ_s.get('sharp_frac', 0)*100:.1f}%")
-
-        # Log latent statistics to CSV every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            write_header = not latent_stats_csv.exists()
-            with open(latent_stats_csv, 'a', newline='') as f:
-                writer = csv.writer(f)
-                if write_header:
-                    writer.writerow([
-                        'epoch', 'beta', 'temperature',
-                        'hm_mu_mean', 'hm_mu_std', 'hm_sigma_mean', 'hm_sigma_std',
-                        'imp_mu_mean', 'imp_mu_std', 'imp_sigma_mean', 'imp_sigma_std',
-                        'shared_mu_mean', 'shared_mu_std', 'shared_sigma_mean', 'shared_sigma_std',
-                        'occ_prob1_mean', 'occ_logit_mag', 'occ_entropy', 'occ_sharp_pct',
-                        'kl_gaussian', 'kl_bernoulli', 'kl_total',
-                        'val_recon', 'val_total'
-                    ])
-                writer.writerow([
-                    epoch + 1, f"{beta:.6f}", f"{temperature:.4f}",
-                    f"{v_ms['heatmap']['mu_mean']:.4f}",   f"{v_ms['heatmap']['mu_std']:.4f}",
-                    f"{v_ms['heatmap']['std_mean']:.4f}",  f"{v_ms['heatmap']['std_std']:.4f}",
-                    f"{v_ms['impedance']['mu_mean']:.4f}", f"{v_ms['impedance']['mu_std']:.4f}",
-                    f"{v_ms['impedance']['std_mean']:.4f}",f"{v_ms['impedance']['std_std']:.4f}",
-                    f"{v_ms['shared']['mu_mean']:.4f}",    f"{v_ms['shared']['mu_std']:.4f}",
-                    f"{v_ms['shared']['std_mean']:.4f}",   f"{v_ms['shared']['std_std']:.4f}",
-                    f"{v_ms['occupancy']['prob1_mean']:.4f}",
-                    f"{v_ms['occupancy'].get('logit_mag', 0):.4f}",
-                    f"{v_ms['occupancy'].get('entropy', 0):.4f}",
-                    f"{v_ms['occupancy'].get('sharp_frac', 0)*100:.2f}",
-                    f"{val_losses['kl_gaussian']:.4f}",
-                    f"{val_losses['kl_bernoulli']:.4f}",
-                    f"{val_losses['kl_loss']:.4f}",
-                    f"{val_losses['recon_loss']:.4f}",
-                    f"{val_losses['total_loss']:.4f}",
-                ])
-
+        print(f"  Latent - μ: {val_losses['mu_mean']:.4f}, σ: {val_losses['std_mean']:.4f} | "
+              f"hm={v_ms['heatmap']['mu_mean']:.3f}/{v_ms['heatmap']['std_mean']:.3f}, "
+              f"occ P(1)={v_ms['occupancy']['prob1_mean']:.3f}, "
+              f"imp={v_ms['impedance']['mu_mean']:.3f}/{v_ms['impedance']['std_mean']:.3f}, "
+              f"mv={v_ms['maxvalue']['mu_mean']:.3f}/{v_ms['maxvalue']['std_mean']:.3f}, "
+              f"shared={v_ms['shared']['mu_mean']:.3f}/{v_ms['shared']['std_mean']:.3f}")
+        
         # Build latent stats dict for inference sampling
         v_ms = val_losses['modality_stats']
         latent_stats = {
             'heatmap':   {'mu_mean': v_ms['heatmap']['mu_mean'],   'mu_std': v_ms['heatmap']['mu_std'],   'sigma_mean': v_ms['heatmap']['std_mean']},
             'impedance': {'mu_mean': v_ms['impedance']['mu_mean'], 'mu_std': v_ms['impedance']['mu_std'], 'sigma_mean': v_ms['impedance']['std_mean']},
+            'maxvalue':  {'mu_mean': v_ms['maxvalue']['mu_mean'],  'mu_std': v_ms['maxvalue']['mu_std'],  'sigma_mean': v_ms['maxvalue']['std_mean']},
             'shared':    {'mu_mean': v_ms['shared']['mu_mean'],    'mu_std': v_ms['shared']['mu_std'],    'sigma_mean': v_ms['shared']['std_mean']},
         }
 
@@ -746,11 +700,14 @@ def train_vae():
     print("TRAINING COMPLETE!")
     print("="*80)
     print(f"Best validation loss: {best_val_loss:.4f}")
-    print(f"Checkpoints: {checkpoint_path}")
+    print(f"Final model saved to: {checkpoint_path / 'best_model.pt'}")
     
     # Generate training plots
+    print("\nGenerating training plots...")
     logger.plot()
     logger.plot_loss_components()
+    
+    # Print training statistics
     logger.print_statistics()
 
 
