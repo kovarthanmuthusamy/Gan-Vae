@@ -5,151 +5,190 @@ import shutil
 from tqdm import tqdm
 
 # Normalization script for heatmap, impedance, and occupancy datasets
-# HEATMAP: Per-sample min-max normalization (each divided by its max absolute value) → [0,1]
-# MAX_VALUE: Extracted from heatmaps, percentile min-max normalized for VAE training
-# IMPEDANCE: Log-scale z-score, clipped to [percentile_lower, percentile_upper] of the z-score distribution
+# HEATMAP: log(1+x) z-score on foreground (mask=1) pixels, background set to fixed sentinel → 1-channel output
+# IMPEDANCE: Log-scale z-score (no clipping)
 # OCCUPANCY: Binary data, copied as-is
-stat_type = "percentile"  # Default to percentile stats for normalization
-def normalize_heatmaps_and_extract_max_values(heatmap_dir, output_heatmap_dir):
 
-    """Normalize heatmaps using per-sample min-max and extract raw max values."""
-    heatmap_dir, output_heatmap_dir = Path(heatmap_dir), Path(output_heatmap_dir)
-    output_heatmap_dir.mkdir(parents=True, exist_ok=True)
-    
+BACKGROUND_VALUE = None  # Computed dynamically as z_min - 1.5 after stats pass
+
+
+def calculate_heatmap_stats(heatmap_dir, percentile_lower=0.1, percentile_upper=99.9):
+    """Pass 1: Compute log(1+x) mean/std over foreground pixels only."""
+    heatmap_dir = Path(heatmap_dir)
     heatmap_files = sorted(heatmap_dir.glob("*.npy"))
-    print(f"\n[1/4] Normalizing {len(heatmap_files)} heatmaps...")
-    
-    max_values_raw = []
-    for path in tqdm(heatmap_files, desc="Heatmaps"):
+    print(f"\n[1/4] Computing heatmap log(1+x) stats from {len(heatmap_files)} files...")
+
+    all_log_fg = []  # collect log(1+x) values for foreground pixels
+    for path in tqdm(heatmap_files, desc="Heatmap stats"):
         data = np.load(path).astype(np.float32)
         if data.ndim < 3 or data.shape[0] < 2:
             raise ValueError(f"Unexpected heatmap shape in {path}: {data.shape}")
-        
-        max_value = max(np.abs(data[0]).max(), 1e-8)
-        max_values_raw.append(max_value)
-        data[0] = np.clip(data[0] / max_value, 0.0, 1.0)
-        np.save(output_heatmap_dir / path.name, data)
-    
-    return np.array(max_values_raw)
+        ch0, mask = data[0], data[1]
+        fg_vals = ch0[mask == 1]  # foreground only
+        if fg_vals.size > 0:
+            all_log_fg.append(np.log1p(fg_vals))  # log(1 + x)
 
-def calculate_stats(imp_dir, max_values_raw, percentile_lower=0.1, percentile_upper=99.9):
-    """Calculate normalization statistics for impedance and max_values."""
+    all_log_fg = np.concatenate(all_log_fg)
+    log_mean = float(all_log_fg.mean())
+    log_std = float(all_log_fg.std())
+    if log_std == 0.0:
+        log_std = 1.0
+
+    print(f"  Foreground log(1+x) stats: mean={log_mean:.4f}, std={log_std:.4f}")
+    print(f"  Foreground log(1+x) range: [{all_log_fg.min():.4f}, {all_log_fg.max():.4f}]")
+    z_scores = (all_log_fg - log_mean) / log_std
+    z_min = float(z_scores.min())
+    z_max = float(z_scores.max())
+    bg_value = round(z_min - 1.5, 4)
+    print(f"  Foreground z-score range: [{z_min:.4f}, {z_max:.4f}]")
+    print(f"  Background sentinel value: {bg_value} (z_min - 1.5)")
+
+    return {"log_mean": log_mean, "log_std": log_std,
+            "fg_pixel_count": int(all_log_fg.size),
+            "z_min": z_min, "z_max": z_max,
+            "background_value": bg_value}
+
+
+def normalize_heatmaps(heatmap_dir, output_heatmap_dir, heatmap_stats):
+    """Pass 2: Apply log(1+x) z-score to foreground, sentinel to background, save 1-channel."""
+    heatmap_dir, output_heatmap_dir = Path(heatmap_dir), Path(output_heatmap_dir)
+    output_heatmap_dir.mkdir(parents=True, exist_ok=True)
+    heatmap_files = sorted(heatmap_dir.glob("*.npy"))
+    print(f"\n[2/4] Normalizing {len(heatmap_files)} heatmaps (1-channel log(1+x) z-score)...")
+
+    log_mean = heatmap_stats["log_mean"]
+    log_std = heatmap_stats["log_std"]
+    bg_value = heatmap_stats["background_value"]
+
+    for path in tqdm(heatmap_files, desc="Heatmaps"):
+        data = np.load(path).astype(np.float32)
+        ch0, mask = data[0], data[1]
+
+        # Apply log(1+x) z-score to foreground
+        log_ch0 = np.log1p(ch0)
+        z_ch0 = (log_ch0 - log_mean) / log_std
+
+        # Set background to sentinel
+        z_ch0[mask == 0] = bg_value
+
+        # Save as 1-channel: (1, 64, 64)
+        np.save(output_heatmap_dir / path.name, z_ch0[np.newaxis].astype(np.float32))
+
+
+def calculate_impedance_stats(imp_dir, percentile_lower=0.1, percentile_upper=99.9):
+    """Calculate impedance log z-score statistics."""
     imp_dir = Path(imp_dir)
-    stats = {"percentile_lower": percentile_lower, "percentile_upper": percentile_upper, 
-             "Impedance": {}, "Max_value": {}}
-    
-    print(f"\n[2/4] Calculating statistics...")
-    
-    # IMPEDANCE - LOG-SCALE STANDARD (Z-SCORE)
-    if imp_dir.exists():
-        imp_files = sorted(imp_dir.glob("*.npy"))
-        imp_values = np.concatenate([np.load(f).flatten() for f in tqdm(imp_files, desc="Impedance")])
-        
-        log_imp = np.log(np.maximum(imp_values, 1e-10))
-        i_mean = float(log_imp.mean())
-        i_std = float(log_imp.std())
-        if i_std == 0.0:
-            i_std = 1.0
+    stats = {}
+    if not imp_dir.exists():
+        return stats
 
-        # Compute clip bounds from the z-score distribution at the requested percentiles
-        z_scores = (log_imp - i_mean) / i_std
-        z_clip_min = float(np.percentile(z_scores, percentile_lower))
-        z_clip_max = float(np.percentile(z_scores, percentile_upper))
-        
-        stats["Impedance"].update({
-            "imp_count": len(imp_files),
-            "log_mean": i_mean,
-            "log_std": i_std,
-            "z_clip_min": z_clip_min,
-            "z_clip_max": z_clip_max,
-        })
-        print(f"\nImpedance stats are calculated and saved")
-        print(f"  z-score clip bounds (p{percentile_lower}/p{percentile_upper}): [{z_clip_min:.4f}, {z_clip_max:.4f}]")
+    imp_files = sorted(imp_dir.glob("*.npy"))
+    imp_values = np.concatenate([np.load(f).flatten() for f in tqdm(imp_files, desc="Impedance stats")])
 
-    # MAX_VALUE - PERCENTILE MIN-MAX
-    mv_global_min, mv_global_max = float(max_values_raw.min()), float(max_values_raw.max())
-    mv_perc_min, mv_perc_max = float(np.percentile(max_values_raw, percentile_lower)), float(np.percentile(max_values_raw, percentile_upper))
-    
-    stats["Max_value"].update({"max_value_count": len(max_values_raw), "global_min": mv_global_min, "global_max": mv_global_max,
-                               "percentile_min": mv_perc_min, "percentile_max": mv_perc_max})
-    
-    print(f"\nMax_value stats are calculated and saved")
+    log_imp = np.log(np.maximum(imp_values, 1e-10))
+    i_mean = float(log_imp.mean())
+    i_std = float(log_imp.std())
+    if i_std == 0.0:
+        i_std = 1.0
+
+    z_scores = (log_imp - i_mean) / i_std
+    z_clip_min = float(np.percentile(z_scores, percentile_lower))
+    z_clip_max = float(np.percentile(z_scores, percentile_upper))
+
+    stats.update({
+        "imp_count": len(imp_files),
+        "log_mean": i_mean,
+        "log_std": i_std,
+        "z_clip_min": z_clip_min,
+        "z_clip_max": z_clip_max,
+    })
+    print(f"  Impedance log z-score: mean={i_mean:.4f}, std={i_std:.4f}")
+    print(f"  z-score clip bounds (p{percentile_lower}/p{percentile_upper}): [{z_clip_min:.4f}, {z_clip_max:.4f}]")
     return stats
 
-def normalize_impedance_and_max_values(imp_dir, max_values_raw, heatmap_files, 
-                                       output_imp_dir, output_max_value_dir, stats):
-    
-    """Normalize impedance using log-scale z-score (no clipping — data range is well-behaved)."""
-    imp_dir, output_imp_dir, output_max_value_dir = Path(imp_dir), Path(output_imp_dir), Path(output_max_value_dir)
-    output_imp_dir.mkdir(parents=True, exist_ok=True)
-    output_max_value_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"\n[3/4] Applying normalization...")
 
-    # Impedance - LOG-SCALE Z-SCORE (no clip — full z-score range preserved)
-    imp_log_mean = stats["Impedance"]["log_mean"]
-    imp_log_std  = stats["Impedance"]["log_std"]
-    
+def normalize_impedance(imp_dir, output_imp_dir, imp_stats):
+    """Normalize impedance using log-scale z-score and add derivative as second channel.
+
+    Output shape: (2, 231)
+      Ch0: z-score of log(impedance)          — raw signal
+      Ch1: first difference of Ch0            — d[i] = z[i+1] - z[i]
+           (last element padded with d[-2] to keep constant length)
+    """
+    imp_dir, output_imp_dir = Path(imp_dir), Path(output_imp_dir)
+    output_imp_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\n[3/4] Normalizing impedance (dual-channel: raw z-score + first derivative)...")
+
+    imp_log_mean = imp_stats["log_mean"]
+    imp_log_std = imp_stats["log_std"]
+
     for path in tqdm(sorted(imp_dir.glob("*.npy")), desc="Impedance"):
         log_data = np.log(np.maximum(np.load(path).astype(np.float32), 1e-10))
-        norm = (log_data - imp_log_mean) / imp_log_std
-        np.save(output_imp_dir / path.name, norm)
-    
-    # Max_values 
-    mv_min, mv_max = stats["Max_value"][f"{stat_type}_min"], stats["Max_value"][f"{stat_type}_max"]
-    mv_denom = mv_max - mv_min if mv_max != mv_min else 1.0
+        z = ((log_data - imp_log_mean) / imp_log_std).flatten()  # Ch0: (231,)
 
-    for i, path in enumerate(tqdm(heatmap_files, desc="Max values")):
-        clipped = np.clip(max_values_raw[i], mv_min, mv_max)
-        max_val_norm = np.array([(clipped - mv_min) / mv_denom], dtype=np.float32)
-        np.save(output_max_value_dir / path.name, max_val_norm)
+        # Ch1: first difference  d[i] = z[i+1] - z[i], length kept at 231
+        # np.diff gives 230 values; pad the last element by repeating d[-1]
+        diff = np.diff(z)                              # (230,)
+        deriv = np.append(diff, diff[-1])              # (231,)  last value repeated
+
+        dual = np.stack([z, deriv], axis=0)            # (2, 231)
+        np.save(output_imp_dir / path.name, dual)
+
 
 def copy_occupancy(occ_dir, output_occ_dir):
     """Copy occupancy maps (binary, no normalization needed)."""
     occ_dir, output_occ_dir = Path(occ_dir), Path(output_occ_dir)
     output_occ_dir.mkdir(parents=True, exist_ok=True)
-    
     print(f"\n[4/4] Copying occupancy files...")
     for path in tqdm(sorted(occ_dir.glob("*.npy")), desc="Occupancy"):
         np.save(output_occ_dir / path.name, np.load(path).astype(np.float32))
 
+
 def main():
     """Main function: 4-step normalization pipeline."""
-    # Define paths
     root = Path(__file__).resolve().parents[1]
     data_root = root / "datasets" / "data"
     output_root = root / "datasets" / "data_norm"
-    
-    
-    heatmap_dir, imp_dir, occ_dir = data_root / "heatmap", data_root / "Imp", data_root / "Occ_map"
-    out_heatmap, out_imp, out_occ, out_max_value = (output_root / "heatmap", output_root / "Imp", 
-                                                      output_root / "Occ_map", output_root / "Max_value")
+
+    heatmap_dir = data_root / "heatmap"
+    imp_dir = data_root / "Imp"
+    occ_dir = data_root / "Occ_map"
+    out_heatmap = output_root / "heatmap"
+    out_imp = output_root / "Imp"
+    out_occ = output_root / "Occ_map"
     stats_file = output_root / "normalization_stats.json"
-    
+
     print(f"\n{'='*60}\nNORMALIZATION PIPELINE\n{'='*60}")
     print(f"Input: {data_root}\nOutput: {output_root}")
-    
+
     if not data_root.exists():
         return print(f"\nError: Input directory does not exist: {data_root}")
-    
-    # Execute pipeline
-    max_values_raw = normalize_heatmaps_and_extract_max_values(heatmap_dir, out_heatmap)
-    stats = calculate_stats(imp_dir, max_values_raw)
-    normalize_impedance_and_max_values(imp_dir, max_values_raw, sorted(heatmap_dir.glob("*.npy")),
-                                       out_imp, out_max_value, stats)
+
+    # Step 1: Compute heatmap stats (foreground-only log(1+x))
+    heatmap_stats = calculate_heatmap_stats(heatmap_dir)
+
+    # Step 2: Normalize heatmaps → 1-channel, log(1+x) z-score, bg=sentinel
+    normalize_heatmaps(heatmap_dir, out_heatmap, heatmap_stats)
+
+    # Step 3: Compute impedance stats & normalize
+    imp_stats = calculate_impedance_stats(imp_dir)
+    normalize_impedance(imp_dir, out_imp, imp_stats)
+
+    # Step 4: Copy occupancy
     copy_occupancy(occ_dir, out_occ)
-    
-    # Save statistics
+
+    # Build and save stats JSON
+    stats = {
+        "background_value": heatmap_stats["background_value"],
+        "Heatmap": heatmap_stats,
+        "Impedance": imp_stats,
+    }
     stats_file.parent.mkdir(parents=True, exist_ok=True)
     with open(stats_file, 'w') as f:
         json.dump(stats, f, indent=2)
-    
-    exp_stats_file = root / "experiments" / "exp017" / "metrics" / "normalization_stats.json"
-    exp_stats_file.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(stats_file, exp_stats_file)
-    
+
     print(f"\n{'='*60}\n✓ NORMALIZATION COMPLETE\n{'='*60}")
-    print(f"Dataset: {output_root}\nStats: {stats_file}\n       {exp_stats_file}")
+    print(f"Dataset: {output_root}\nStats: {stats_file}")
 
 
 if __name__ == "__main__":

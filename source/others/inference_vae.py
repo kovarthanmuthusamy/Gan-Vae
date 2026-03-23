@@ -31,7 +31,7 @@ SOURCE_DIR = PROJECT_ROOT
 if str(SOURCE_DIR) not in sys.path:
     sys.path.insert(0, str(SOURCE_DIR))
 
-from source.model.vae_multi_input_simple import MultiInputVAE
+from experiments.exp020.codes_1.vae_multi_input_simple import MultiInputVAE
 from Data_Creation.csv_to_occupancy import visualize_occupancy_vector
 
 
@@ -47,11 +47,11 @@ MODEL_LATENT_DIM = 132          # Latent dimension (must match training)
 
 # --- Generation Configuration ---
 NUM_SAMPLES = 20               # Number of samples to generate
-OUTPUT_DIR = "experiments/exp020/visuals_3"  # Directory to save outputs
+OUTPUT_DIR = "experiments/exp020/visuals_2"  # Directory to save outputs
 SAVE_DATA = True                # Save raw .npy data files
 SAVE_PLOTS = True               # Save visualization plots
 
-stat_type = "percentile"  # Choose which stats to use for normalization (global or percentile)
+#stat_type = "percentile"  # Choose which stats to use for normalization (global or percentile)
 
 # --- Device Configuration ---
 USE_CUDA = True                 # Use CUDA if available
@@ -82,7 +82,7 @@ class VAEInference:
             norm_stats = json.load(f)
         
         # Extract values for denormalization
-        print(f"Using {stat_type} stats for normalization")
+       # print(f"Using {stat_type} stats for normalization")
         self.imp_log_mean = norm_stats["Impedance"]["log_mean"]
         self.imp_log_std = norm_stats["Impedance"]["log_std"]
         self.hm_log_mean = norm_stats["Heatmap"]["log_mean"]
@@ -104,7 +104,56 @@ class VAEInference:
         
         # Initialize model
         self.model = MultiInputVAE(latent_dim=latent_dim)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Robust checkpoint loading: for pure generation we only require decoder + latent heads.
+        # This allows inference even if encoder architecture evolved after training.
+        checkpoint_state = checkpoint['model_state_dict']
+        model_state = self.model.state_dict()
+
+        compatible_state = {}
+        skipped_keys = []
+        for key, value in checkpoint_state.items():
+            if key in model_state and model_state[key].shape == value.shape:
+                compatible_state[key] = value
+            else:
+                skipped_keys.append(key)
+
+        load_result = self.model.load_state_dict(compatible_state, strict=False)
+
+        # Generation path depends on latent heads + decoders; require all of them.
+        required_prefixes = (
+            'heatmap_fc.',
+            'heatmap_deconv.',
+            'occupancy_decoder.',
+            'impedance_decoder.',
+            'heatmap_mu_private.',
+            'occupancy_logits_private.',
+            'impedance_mu_private.',
+            'heatmap_mu_shared.',
+            'occupancy_mu_shared.',
+            'impedance_mu_shared.',
+        )
+        missing_required = [
+            k for k in load_result.missing_keys
+            if k.startswith(required_prefixes)
+        ]
+        if missing_required:
+            raise RuntimeError(
+                "Checkpoint is incompatible for inference: missing generation-critical "
+                f"weights: {missing_required[:12]}"
+            )
+
+        loaded_count = len(compatible_state)
+        total_count = len(checkpoint_state)
+        print(f"Loaded {loaded_count}/{total_count} checkpoint tensors into model")
+        if skipped_keys:
+            preview = ', '.join(skipped_keys[:8])
+            suffix = ' ...' if len(skipped_keys) > 8 else ''
+            print(
+                f"Skipped {len(skipped_keys)} incompatible tensors "
+                f"(typically encoder-only for inference): {preview}{suffix}"
+            )
+
         self.model.to(self.device)
         self.model.eval()
         
@@ -161,7 +210,32 @@ class VAEInference:
             occupancy_binary = (occupancy >= 0.5).float()
             
             # Denormalize impedance from z-score to log scale
-            impedance_denorm = impedance_norm * self.imp_log_std + self.imp_log_mean
+            # Dual-channel model outputs (B, 2, 231): Ch0=raw z-score, Ch1=first derivative
+            if impedance_norm.dim() == 3 and impedance_norm.shape[1] == 2:
+                impedance_deriv_norm = impedance_norm[:, 1, :]  # (B, 231) — derivative channel
+                z_raw  = impedance_norm[:, 0, :]                # (B, 231) — raw channel
+
+                # --- Integration Correction (Physics Constraint) ---
+                # d[i] = z[i+1] - z[i]  (constant spacing, so cumsum inverts it)
+                # z_integ[0]   = z_raw[0]
+                # z_integ[i]   = z_raw[0] + sum(d[0..i-1])   for i >= 1
+                d = impedance_deriv_norm                        # (B, 231)
+                z_integ = torch.cat(
+                    [z_raw[:, :1],
+                     z_raw[:, :1] + torch.cumsum(d, dim=-1)[:, :-1]],
+                    dim=-1
+                )                                               # (B, 231)
+                # Blend: cancel random noise while reinforcing structural peaks
+                z_blended = 0.5 * (z_raw + z_integ)            # (B, 231)
+
+                impedance_denorm       = z_blended * self.imp_log_std + self.imp_log_mean
+                impedance_raw_denorm   = z_raw     * self.imp_log_std + self.imp_log_mean
+                impedance_integ_denorm = z_integ   * self.imp_log_std + self.imp_log_mean
+            else:
+                impedance_deriv_norm   = None
+                impedance_raw_denorm   = None
+                impedance_integ_denorm = None
+                impedance_denorm = impedance_norm * self.imp_log_std + self.imp_log_mean
             
             # Post-process heatmap: stamp sentinel on background using occupancy
             # Occupancy tells us which regions are foreground
@@ -180,7 +254,10 @@ class VAEInference:
         heatmap_zscore_cpu = heatmap_zscore.cpu().numpy()
         heatmap_physical_cpu = heatmap_physical.cpu().numpy()
         occupancy_cpu = occupancy_binary.cpu().numpy()  # Use binary occupancy
-        impedance_cpu = impedance_denorm.cpu().numpy()
+        impedance_cpu        = impedance_denorm.cpu().numpy()        # blended (main output)
+        impedance_deriv_cpu  = impedance_deriv_norm.cpu().numpy()   if impedance_deriv_norm   is not None else None
+        impedance_raw_cpu    = impedance_raw_denorm.cpu().numpy()   if impedance_raw_denorm   is not None else None
+        impedance_integ_cpu  = impedance_integ_denorm.cpu().numpy() if impedance_integ_denorm is not None else None
         
         print(f"\nGenerated shapes:")
         print(f"  Heatmap (z-score): {heatmap_zscore_cpu.shape}")
@@ -201,7 +278,11 @@ class VAEInference:
             np.save(data_dir / f"heatmap_zscore.npy", heatmap_zscore_cpu[i])
             np.save(data_dir / f"heatmap_physical.npy", heatmap_physical_cpu[i])  # Denormalized
             np.save(data_dir / f"occupancy_map.npy", occupancy_cpu[i])
-            np.save(data_dir / f"impedance_profile.npy", impedance_cpu[i])  # Denormalized (log scale)
+            np.save(data_dir / f"impedance_profile.npy", impedance_cpu[i])  # blended (log scale)
+            if impedance_deriv_cpu is not None:
+                np.save(data_dir / f"impedance_derivative.npy",  impedance_deriv_cpu[i])   # z-score derivative
+                np.save(data_dir / f"impedance_raw.npy",          impedance_raw_cpu[i])     # type: ignore # ch0 raw (log scale)
+                np.save(data_dir / f"impedance_integrated.npy",   impedance_integ_cpu[i])   # type: ignore # cumsum-reconstructed (log scale)
             
             print(f"\nSaved sample {i} data to: {data_dir}")
             print(f"  Heatmap physical range: [{heatmap_physical_cpu[i].min():.4f}, {heatmap_physical_cpu[i].max():.4f}]")
@@ -213,25 +294,39 @@ class VAEInference:
                 impedance_log=impedance_cpu[i],
                 occupancy=occupancy_cpu[i],
                 sample_idx=i,
-                output_dir=data_dir
+                output_dir=data_dir,
+                impedance_derivative=impedance_deriv_cpu[i]   if impedance_deriv_cpu  is not None else None,
+                impedance_raw_log=impedance_raw_cpu[i]        if impedance_raw_cpu     is not None else None,
+                impedance_integ_log=impedance_integ_cpu[i]    if impedance_integ_cpu   is not None else None,
             )
     
-    def visualize_sample(self, heatmap_physical, impedance_log, occupancy, sample_idx, output_dir):
+    def visualize_sample(self, heatmap_physical, impedance_log, occupancy, sample_idx, output_dir,
+                         impedance_derivative=None, impedance_raw_log=None, impedance_integ_log=None):
         """
-        Visualize generated sample with subplots for heatmap, impedance, and occupancy
-        
+        Visualize generated sample with subplots for heatmap, impedance, and occupancy.
+        For dual-channel models the impedance plot shows:
+          - raw ch0 reconstruction (thin dotted blue)
+          - derivative-integrated reconstruction (thin dotted green)
+          - blended physics-constraint result (solid blue, main output)
+          - derivative overlaid on a twin y-axis (thin dotted orange)
+
         Args:
-            heatmap_physical: Denormalized physical heatmap (1, 64, 64)
-            impedance_log: Denormalized impedance in log scale (231,)
-            occupancy: Occupancy vector (52,) or compatible shape
-            sample_idx: Sample index for title
-            output_dir: Directory to save visualization
+            heatmap_physical:    Denormalized physical heatmap (1, 64, 64)
+            impedance_log:       Blended impedance in log scale (231,)
+            occupancy:           Occupancy vector (52,) or compatible shape
+            sample_idx:          Sample index for title
+            output_dir:          Directory to save visualization
+            impedance_derivative: Optional z-score first derivative (231,)
+            impedance_raw_log:   Optional raw ch0 impedance in log scale (231,)
+            impedance_integ_log: Optional cumsum-reconstructed impedance in log scale (231,)
         """
-        # Create figure with subplots
+        #print(occupancy)
+        # Create figure with subplots (3 cols always; derivative overlaid on impedance plot)
+        n_cols = 3
         fig = plt.figure(figsize=(18, 5))
         
         # Subplot 1: Heatmap (Channel 0 - impedance channel)
-        ax1 = plt.subplot(1, 3, 1)
+        ax1 = plt.subplot(1, n_cols, 1)
         heatmap_ch0 = heatmap_physical[0]  # Extract channel 0 (1, 64, 64) -> (64, 64)
         # Apply spatial board mask: background pixels are masked and shown as white
         heatmap_masked = np.ma.masked_where(~self.binary_mask, heatmap_ch0)
@@ -247,27 +342,46 @@ class VAEInference:
         ax1.set_title(f'Generated Heatmap (Sample {sample_idx})', fontsize=14)
         ax1.set_xlabel('X', fontsize=12)
         ax1.set_ylabel('Y', fontsize=12)
-        plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cb = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        vmin, vmax = im1.get_clim()
+        cb.set_ticks(np.linspace(vmin, vmax, 6))  # type: ignore # 6 ticks: always includes both endpoints
         
         # Subplot 2: Impedance Profile
-        ax2 = plt.subplot(1, 3, 2)
-        # Convert from log scale to Ohm scale
-        impedance_ohm = np.exp(impedance_log)
+        ax2 = plt.subplot(1, n_cols, 2)
         # Plot target impedance
-        ax2.loglog(self.frequency, self.target_impedance, 
+        ax2.loglog(self.frequency, self.target_impedance,
                   linestyle='--', linewidth=2.5, label='Target Impedance', color='red')
-        # Plot generated impedance
-        ax2.loglog(self.frequency, impedance_ohm,
-                  linestyle='-', linewidth=2.5, label='Generated Impedance', color='blue')
+        # Show only the integration-reconstructed curve (from derivative channel)
+        if impedance_integ_log is not None:
+            ax2.loglog(self.frequency, np.exp(impedance_integ_log),
+                      linestyle='-', linewidth=2.5, color='mediumseagreen', label='Integrated (from derivative)')
+        else:
+            # Fallback: if no integ curve available, show the main output
+            ax2.loglog(self.frequency, np.exp(impedance_log),
+                      linestyle='-', linewidth=2.5, label='Generated Impedance', color='blue')
         ax2.set_ylim(1e-3, 1e2)
         ax2.set_xlabel('Frequency (Hz)', fontsize=12)
         ax2.set_ylabel('Impedance (Ohm)', fontsize=12)
         ax2.set_title(f'Impedance Profile (Sample {sample_idx})', fontsize=14)
-        ax2.legend(fontsize=10)
         ax2.grid(True, which='both', alpha=0.3)
-        
+
+        # Overlay derivative on twin y-axis (thin dotted line)
+        if impedance_derivative is not None:
+            ax2b = ax2.twinx()
+            ax2b.semilogx(self.frequency, impedance_derivative,
+                          linestyle=':', linewidth=1.2, color='darkorange', label='Derivative (z-score)')
+            ax2b.axhline(0, color='darkorange', linewidth=0.6, linestyle=':', alpha=0.4)
+            ax2b.set_ylabel('First Derivative (z-score)', fontsize=11, color='darkorange')
+            ax2b.tick_params(axis='y', labelcolor='darkorange')
+            # Combined legend
+            lines1, labels1 = ax2.get_legend_handles_labels()
+            lines2, labels2 = ax2b.get_legend_handles_labels()
+            ax2.legend(lines1 + lines2, labels1 + labels2, fontsize=10)
+        else:
+            ax2.legend(fontsize=10)
+
         # Subplot 3: Active capacitors from occupancy vector
-        ax3 = plt.subplot(1, 3, 3)
+        ax3 = plt.subplot(1, n_cols, 3)
         active_labels = visualize_occupancy_vector(occupancy.flatten())
         label_str = ', '.join(active_labels) if active_labels else 'None'
         ax3.axis('off')

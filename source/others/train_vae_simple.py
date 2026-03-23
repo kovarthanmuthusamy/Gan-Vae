@@ -77,7 +77,7 @@ class Config:
     
     # Checkpoints
 
-    experiment_dir: str = "experiments/exp020"  # Directory to save checkpoints and logs
+    experiment_dir: str = "experiments/exp021"  # Directory to save checkpoints and logs
     checkpoint_interval: int = 10
     resume_checkpoint: str = ""  
     
@@ -173,7 +173,7 @@ def vae_loss(recon_heatmap, recon_occupancy, recon_impedance,
     # Heatmap loss (foreground-masked: exclude background sentinel pixels)
     # Sentinel = config.background_value (z-score of log(1+0) ≈ -3.62); foreground z_min ≈ -2.12
     fg_mask = (target_heatmap > config.background_value + 0.5).float()  # 1=foreground, 0=background
-    huber_elem = F.huber_loss(recon_heatmap, target_heatmap, delta=0.5, reduction='none')
+    huber_elem = F.huber_loss(recon_heatmap, target_heatmap, delta=3.0, reduction='none')
     fg_count = fg_mask.sum().clamp(min=1.0)
     loss_heatmap = (huber_elem * fg_mask).sum() / fg_count
 
@@ -184,7 +184,7 @@ def vae_loss(recon_heatmap, recon_occupancy, recon_impedance,
         reduction='mean'
     )
 
-    loss_impedance = F.huber_loss(recon_impedance, target_impedance, delta=0.5, reduction='mean')
+    loss_impedance = F.huber_loss(recon_impedance, target_impedance, delta=5.0, reduction='mean')
 
     # Total reconstruction loss (weighted)
     recon_loss = (config.heatmap_weight * loss_heatmap +

@@ -4,7 +4,7 @@ Data loader for Multi-Input VAE training
 Loads three modalities from disk:
 1. Heatmap: 1x64x64 (log(1+x) z-score normalized, background=sentinel)
 2. Occupancy Vector: 52
-3. Impedance Vector: 231 (log z-score normalized)
+3. Impedance Vector: (2, 231) — Ch0: log z-score, Ch1: first derivative
 """
 
 import numpy as np
@@ -85,15 +85,25 @@ class VAEDataset(Dataset):
         # Load heatmap (1, 64, 64) - already normalized (log(1+x) z-score)
         heatmap_norm = np.load(self.heatmap_dir / f"{filename}.npy")  # (1, 64, 64)
         
-        # Load impedance (231,)
-        impedance = np.load(self.impedance_dir / f"{filename}.npy")  # (231,)
+        # Load impedance — supports both old (231,)/(231,1) and new (2,231) dual-channel format
+        impedance_raw = np.load(self.impedance_dir / f"{filename}.npy")  # (2,231) or (231,) or (231,1)
         
         # Load occupancy vector (52,)
         occupancy = np.load(self.occupancy_dir / f"{filename}.npy").flatten()  # (52,)
         
         # Convert to tensors
         heatmap_norm = torch.from_numpy(heatmap_norm).float()  # (1, 64, 64)
-        impedance = torch.from_numpy(impedance).float().view(-1)  # (231,)
+
+        # Normalise impedance tensor shape to (2, 231)
+        if impedance_raw.ndim == 2 and impedance_raw.shape[0] == 2:
+            # Already dual-channel (2, 231) — use as-is
+            impedance = torch.from_numpy(impedance_raw).float()          # (2, 231)
+        else:
+            # Legacy single-channel: build a zero derivative channel so shape is consistent
+            z = torch.from_numpy(impedance_raw.flatten()).float()         # (231,)
+            deriv = torch.zeros_like(z)                                   # (231,) — placeholder
+            impedance = torch.stack([z, deriv], dim=0)                    # (2, 231)
+
         occupancy = torch.from_numpy(occupancy).float()  # (52,)
         occupancy = torch.clamp(occupancy, 0.0, 1.0)
         
@@ -219,7 +229,9 @@ if __name__ == "__main__":
     for batch in train_loader:
         print(f"Heatmap shape: {batch['heatmap_norm'].shape}")
         print(f"Occupancy shape: {batch['occupancy'].shape}")
-        print(f"Impedance shape: {batch['impedance'].shape}")
+        print(f"Impedance shape: {batch['impedance'].shape}  — expected (B, 2, 231)")
+        print(f"  Ch0 (z-score)   range: [{batch['impedance'][:,0,:].min():.3f}, {batch['impedance'][:,0,:].max():.3f}]")
+        print(f"  Ch1 (derivative) range: [{batch['impedance'][:,1,:].min():.3f}, {batch['impedance'][:,1,:].max():.3f}]")
         print(f"Filenames: {batch['filenames']}")
         print(f"Heatmap range: [{batch['heatmap_norm'].min():.3f}, {batch['heatmap_norm'].max():.3f}]")
         break

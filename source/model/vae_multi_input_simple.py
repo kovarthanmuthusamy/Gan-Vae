@@ -11,6 +11,35 @@ from typing import Optional, Tuple, Dict, cast
 
 Dr_value = 0.1  # Global dropout rate used throughout the model
 
+
+class SE1d(nn.Module):
+    """
+    Squeeze-and-Excitation block for 1D feature maps (B, C, L).
+
+    Squeeze:  global average pool over the temporal axis → (B, C)
+    Excite:   two-layer FC bottleneck (C → C//reduction → C) + Sigmoid → (B, C)
+    Scale:    broadcast-multiply attention weights back onto the feature map.
+
+    Lets the impedance encoder re-weight frequency-band channels
+    adaptively before the next conv, emphasising resonance-relevant bands.
+    """
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        bottleneck = max(channels // reduction, 1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, bottleneck, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(bottleneck, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, L)
+        s = x.mean(dim=2)           # Squeeze:  (B, C)
+        s = self.fc(s)              # Excite:   (B, C)
+        return x * s.unsqueeze(2)   # Scale:    (B, C, L)
+
+
 # Encoder for multiple head /multi-modal VAE
 class MultiInputVAE(nn.Module):
     def __init__(self, latent_dim=132,
@@ -81,19 +110,23 @@ class MultiInputVAE(nn.Module):
         )
 
         self.impedance_encoder = nn.Sequential(
-            # Input: (Batch, 1, 231) — 4-layer Conv1d with BatchNorm on all layers
+            # Input: (Batch, 1, 231) — 4-layer Conv1d + SE blocks for channel re-weighting
             nn.Conv1d(1, 16, kernel_size=7, stride=2, padding=3),   # 231 -> 116
             nn.BatchNorm1d(16),
             nn.LeakyReLU(0.1),
+            SE1d(16, reduction=4),                                   # SE: focus on dominant bands
             nn.Conv1d(16, 32, kernel_size=5, stride=2, padding=2),  # 116 -> 58
             nn.BatchNorm1d(32),
             nn.LeakyReLU(0.1),
+            SE1d(32, reduction=4),
             nn.Conv1d(32, 64, kernel_size=3, stride=2, padding=1),  # 58 -> 29
             nn.BatchNorm1d(64),
             nn.LeakyReLU(0.1),
+            SE1d(64, reduction=4),
             nn.Conv1d(64, 128, kernel_size=3, stride=2, padding=1), # 29 -> 15
             nn.BatchNorm1d(128),
             nn.LeakyReLU(0.1),
+            SE1d(128, reduction=4),
             nn.Flatten(),
             nn.Linear(128 * 15, 256),
             nn.LeakyReLU(0.1),
