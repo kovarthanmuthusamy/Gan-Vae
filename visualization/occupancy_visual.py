@@ -5,8 +5,10 @@ import matplotlib.pyplot as plt
 #----------------------------------------------------------------------------
 # Parameters for visualization - Update these for each run
 #----------------------------------------------------------------------------
-occupancy_path = "experiments/exp010/visuals/data_sample_2/occupancy_map.npy" 
-output_dir = "experiments/exp010/visuals/data_sample_2"
+# Range of samples to process (e.g., 1 to 4 will process data_sample_1, data_sample_2, etc.)
+sample_start = 1
+sample_end = 4
+experiment = "exp012"
 
 #----------------------------------------------------------------------------
 # Visualization function for occupancy maps
@@ -96,5 +98,23 @@ def plot_occupancy_map(occupancy, output_dir):
 # Main execution
 #----------------------------------------------------------------------------
 if __name__ == "__main__":
-    occupancy = np.load(occupancy_path)
-    plot_occupancy_map(occupancy, output_dir)
+    for sample_num in range(sample_start, sample_end + 1):
+        occupancy_path = f"experiments/{experiment}/visuals/data_sample_{sample_num}/occupancy_map.npy"
+        output_dir = f"experiments/{experiment}/visuals/data_sample_{sample_num}"
+        
+        print(f"\n{'='*60}")
+        print(f"Processing data_sample_{sample_num}")
+        print(f"{'='*60}")
+        
+        try:
+            occupancy = np.load(occupancy_path)
+            plot_occupancy_map(occupancy, output_dir)
+            print(f"✓ Successfully processed data_sample_{sample_num}")
+        except FileNotFoundError:
+            print(f"✗ File not found: {occupancy_path}")
+        except Exception as e:
+            print(f"✗ Error processing data_sample_{sample_num}: {e}")
+    
+    print(f"\n{'='*60}")
+    print(f"Completed processing samples {sample_start} to {sample_end}")
+    print(f"{'='*60}")

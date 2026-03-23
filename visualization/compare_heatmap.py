@@ -22,18 +22,18 @@ from pathlib import Path
 stats_type = "percentile_min_max"  # Options: "percentile_min_max", "global_min_max"
 
 # Define input directory and output path
-input_dir = Path("experiments/exp010/visuals")
+input_dir = Path("experiments/exp012/visuals")
 OUTPUT_PATH = input_dir / "generated_vs_real_heatmap.png"
 
 # 2. Automate the list creation
-# This creates a list for indices 1, 2, and 3
+# This creates a list for indices 0, 1, and 2
 COMPARISONS = [
     {
         "generated": input_dir / f"data_sample_{i}" / "heatmap.npy",
         "real": input_dir / f"data_sample_{i}" / "Real_Heatmap.map/PI/Power_GND/Z_0063.000MHz.map",
         "label": f"data_sample_{i}"
     }
-    for i in range(0, 3)
+    for i in range(0, 5)  # Generate comparisons for samples 0 to 4
 ]
 
 # Binary mask path
@@ -106,9 +106,6 @@ def load_map_file(file_path, resolution=64):
     if np.any(nan_mask):
         rbf = RBFInterpolator(points, z, smoothing=0.15)
         Zi[nan_mask] = rbf(np.column_stack((Xi[nan_mask], Yi[nan_mask])))
-
-    # Flip vertically to match generated heatmap orientation (imshow origin='upper')
-    Zi = np.flipud(Zi)
 
     return Zi
 
@@ -238,8 +235,8 @@ def main():
     
     # Load normalization stats
     stats_path = repo_root / NORMALIZATION_STATS_PATH
-    stats = load_normalization_stats(stats_path)
-    stats = stats.get(stats_type, stats[stats_type])  # Use specified stats type or default 
+    norm_stats = load_normalization_stats(stats_path)
+    stats = norm_stats.get(stats_type, norm_stats[stats_type])  # Use specified stats type or default 
     print(f"Loaded normalization stats - heatmap min: {stats['heatmap_min']:.4f}, max: {stats['heatmap_max']:.4f}")
     
     # Load all comparisons
@@ -247,7 +244,7 @@ def main():
     for comp in COMPARISONS:
         # Load generated heatmap
         gen_path = repo_root / comp["generated"]
-        generated = load_generated_heatmap(gen_path, stats=stats)
+        generated = load_generated_heatmap(gen_path, stats=norm_stats, stats_type=stats_type)
         print(f"Loaded generated heatmap for {comp['label']}: {generated.shape}")
         
         # Load real heatmap from .map file

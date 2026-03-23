@@ -18,7 +18,7 @@ import json
 stats_type = "percentile_min_max"  # Options: "percentile_min_max", "global_min_max"
 
 # Define input directory and output path
-input_dir = Path("experiments/exp010/visuals")
+input_dir = Path("experiments/exp012/visuals")
 OUTPUT_PATH = input_dir / "generated_vs_real_impedance_profile.png"
 
 # 2. Automate the list creation
@@ -29,7 +29,7 @@ COMPARISONS = [
         "real": input_dir / f"data_sample_{i}" / "Real_Imp.csv",
         "label": f"data_sample_{i}"
     }
-    for i in range(0, 3)
+    for i in range(0, 5)  # Generate comparisons for samples 0 to 4
 ]
 
 # Target impedance path
