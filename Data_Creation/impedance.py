@@ -74,9 +74,9 @@ def visualize_impedance(impedance_file, output_path=None, show=True):
         ax.set_title("Impedance Profile", fontsize=14)
         ax.legend(fontsize=11)
         ax.grid(True, which="both", alpha=0.3)
-        ax.set_ylim(1e-3, 1e2)
+        ax.set_ylim(1e-4, 1e3)
         
-        plt.tight_layout()
+        #plt.tight_layout()
         
         if output_path:
             plt.savefig(output_path, dpi=150, bbox_inches='tight')

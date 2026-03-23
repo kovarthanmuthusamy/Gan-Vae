@@ -45,15 +45,23 @@ def create_Heatmaps(file_path, grid_size=HEATMAP_GRID_SIZE, frame_path=None, mas
         mask_board = load_mask_board(frame_path)
     
     points = np.column_stack((x, y))
-    # Use linear interpolation (faster than cubic) and fill NaNs with nearest neighbor
-    Zi = griddata(points, z, (Xi, Yi), method="linear")
-    
-    # Only use RBF for significant NaN regions (more efficient)
-    nan_mask = np.isnan(Zi)
-    if np.any(nan_mask):
-        # Fill with nearest neighbor first (fast)
-        Zi_nearest = griddata(points, z, (Xi, Yi), method="nearest")
-        Zi[nan_mask] = Zi_nearest[nan_mask]
+    # Deduplicate: MAP files share vertices between triangles — same (x,y) appears multiple times.
+    # RBFInterpolator with smoothing=0 requires unique coordinates; average z at duplicates.
+    pts_unique, inverse = np.unique(points, axis=0, return_inverse=True)
+    z_unique = np.array([z[inverse == i].mean() for i in range(len(pts_unique))], dtype=np.float32)
+
+    # RBF interpolation — globally accurate, no boundary NaNs
+    # Falls back to cubic griddata if matrix is still singular after dedup
+    try:
+        rbf = RBFInterpolator(pts_unique, z_unique, kernel='thin_plate_spline', smoothing=0)
+        Zi = rbf(np.column_stack([Xi.ravel(), Yi.ravel()])).reshape(grid_size, grid_size)
+    except np.linalg.LinAlgError:
+        # Remaining degeneracy — fall back to cubic + nearest-neighbor NaN fill
+        Zi = griddata(points, z, (Xi, Yi), method="cubic")
+        nan_mask = np.isnan(Zi)
+        if np.any(nan_mask):
+            Zi_nearest = griddata(points, z, (Xi, Yi), method="nearest")
+            Zi[nan_mask] = Zi_nearest[nan_mask]
     
     # Pre-cast mask_board once
     if mask_board is None:

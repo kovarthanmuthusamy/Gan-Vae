@@ -5,9 +5,9 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache
 
-from heatmap import create_Heatmaps, load_mask_board, HEATMAP_GRID_SIZE
-from occupancy import create_occupancy_grid, OCC_GRID_H, OCC_GRID_W
+from heatmap import create_Heatmaps, load_mask_board
 from impedance import read_impedance_file, EXPECTED_IMP_LENGTH
+from csv_to_occupancy import create_occupancy_vector
 
 # ============================================================
 # BASE PATHS
@@ -24,7 +24,7 @@ OUTPUT_HEATMAP_DIR = TRAIN_DATA_ROOT / "heatmap"
 OUTPUT_IMPEDANCE_DIR = TRAIN_DATA_ROOT / "Imp"
 OUTPUT_OCCUPANCY_DIR = TRAIN_DATA_ROOT / "Occ_map"
 
-# ============================================================
+# =========================================================
 # INPUT/SOURCE CONFIGURATION
 # Specify dataset source and file patterns
 # ============================================================
@@ -40,7 +40,7 @@ DEFAULT_DATA_ROOT = next((Path(p) for p in [
 # RANDOM SAMPLE SIZE CONFIGURATION
 # Set to None to include ALL samples
 # ============================================================
-MAX_SAMPLES = 15000  # Set to a number to limit samples, or None for all
+MAX_SAMPLES = 30000  # Set to a number to limit samples, or None for all
 # ============================================================
 
 def _read_csv(filepath, cols=None, **kwargs):
@@ -176,7 +176,7 @@ def _process_sample(task):
     """Processes a single sample with heatmap, impedance, and occupancy grid."""
     idx, sample, hm_dir, imp_dir, occ_dir, verbose = task
     try:
-        stacked = create_Heatmaps(sample["heatmap_path"], mask_board=_WORKER_MASK_BOARD, verbose=False)
+        stacked = create_Heatmaps(sample["heatmap_path"], mask_board=_WORKER_MASK_BOARD, verbose=True)
         imp = read_impedance_file(sample["impedance_path"])
         if imp is None:
             return (idx, False, f"Failed to read impedance")
@@ -186,15 +186,15 @@ def _process_sample(task):
         np.save(hm_dir / name, stacked)
         np.save(imp_dir / name, imp.reshape(-1, 1))
         if sample["decap_vector"] is not None:
-            occ_grid = create_occupancy_grid(sample["decap_vector"])
-            np.save(occ_dir / name, occ_grid)
+            occ_vec = create_occupancy_vector(sample["decap_vector"])
+            np.save(occ_dir / name, occ_vec)
         return (idx, True, None)
     except Exception as e:
         return (idx, False, str(e)[:100])
 
 def create_training_dataset(output_root=TRAIN_DATA_ROOT, data_root=None, 
                             max_samples: int | None = MAX_SAMPLES, 
-                            num_workers=None, verbose=False):
+                            num_workers=None, verbose=True):
     """Creates training dataset with heatmaps, impedance, and occupancy grids."""
     hm_dir, imp_dir, occ_dir = Path(output_root) / "heatmap", Path(output_root) / "Imp", Path(output_root) / "Occ_map"
     for d in (hm_dir, imp_dir, occ_dir):
@@ -257,7 +257,7 @@ def create_training_dataset(output_root=TRAIN_DATA_ROOT, data_root=None,
     tasks = [(i, s, hm_dir, imp_dir, occ_dir, verbose) for i, s in enumerate(selected_samples)]
     
     # Use multiprocessing for faster processing
-    num_workers = num_workers if num_workers and num_workers > 0 else min(4, os.cpu_count() or 1)
+    num_workers = num_workers if num_workers and num_workers > 0 else min(48, os.cpu_count() or 1)
     print(f"\nRunning with {num_workers} workers...")
     results = []
     
@@ -306,25 +306,38 @@ def create_training_dataset(output_root=TRAIN_DATA_ROOT, data_root=None,
     success_count = sum(1 for r in results if r)
     return success_count
 
+
+
 if __name__ == "__main__":
+    import sys
+    
+    # Check for CSV-only mode as command-line argument
+    if len(sys.argv) > 1 and sys.argv[1] == "--csv-only":
+        print("\n🔄 CSV-ONLY MODE: Creating occupancy grids from CSV\n")
+        
+        # Get CSV path from command line or use default
+        csv_path = sys.argv[2] if len(sys.argv) > 2 else (
+            DEFAULT_DATA_ROOT / "decap_combinations" / "decap_vectors.csv" 
+            if DEFAULT_DATA_ROOT else None
+        )
+    
+    # Normal mode: full dataset creation
     print("=" * 60)
     print("DATASET CREATION CONFIGURATION")
     print("=" * 60)
     print(f"Output Directory:  {TRAIN_DATA_ROOT}")
     print(f"Data Root:         {DEFAULT_DATA_ROOT or 'Not found'}")
     print(f"Max Samples:       {MAX_SAMPLES if MAX_SAMPLES else 'All'}")
-    print(f"Workers:           4")
-    print(f"Verbose:           False")
+    print(f"Workers:           64")
+    print(f"Verbose:           True")
     print("=" * 60)
-    print()
-    
     print("Starting dataset creation...")
     count = create_training_dataset(
         output_root=TRAIN_DATA_ROOT,
         data_root=None,
         max_samples=MAX_SAMPLES,
-        num_workers=4,
-        verbose=False
+        num_workers=64,
+        verbose=True
     )
     print(f"✓ Processed {count} samples")
     print(f"✓ Output saved to: {TRAIN_DATA_ROOT}")

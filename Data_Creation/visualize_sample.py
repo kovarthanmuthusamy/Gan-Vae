@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from heatmap import visualize_heatmap
 from impedance import visualize_impedance
-from occupancy import visualize_occupancy_grid, OCC_GRID_MAP, INVALID_OCC_CELLS
+from csv_to_occupancy import visualize_occupancy_vector
 
 
 class InteractiveSampleViewer:
@@ -131,49 +131,26 @@ class InteractiveSampleViewer:
                 axes[1].set_ylabel('Impedance (Ω)')
             
             axes[1].set_title('Impedance Curve', fontsize=12, fontweight='bold')
+            axes[1].set_ylim(bottom=1e-4)
             axes[1].grid(True, alpha=0.3, linestyle='--')
         else:
             axes[1].text(0.5, 0.5, 'Impedance not found', ha='center', va='center', transform=axes[1].transAxes)
             axes[1].set_title('Impedance')
             print(f"✗ Impedance file not found: {impedance_file}")
         
-        # 3. Visualize occupancy grid - using logic from occupancy.py with labels
+        # 3. Active capacitor labels from occupancy vector
         if occ_file.exists():
-            occ_grid = np.load(occ_file)
-            # Plot raw binary occupancy grid
-            im3 = axes[2].imshow(occ_grid, cmap='binary', vmin=0, vmax=1, interpolation='nearest')
-            axes[2].set_title('Occupancy Grid', fontsize=12, fontweight='bold')
-            axes[2].set_xlabel('Width')
-            axes[2].set_ylabel('Height')
-            
-            # Add grid lines
-            for i in range(occ_grid.shape[0] + 1):
-                axes[2].axhline(i - 0.5, color='gray', linewidth=0.5, alpha=0.5)
-            for j in range(occ_grid.shape[1] + 1):
-                axes[2].axvline(j - 0.5, color='gray', linewidth=0.5, alpha=0.5)
-            
-            # Annotate cells with labels and show which are occupied
-            occupied_labels = []
-            for (h, w), label in OCC_GRID_MAP.items():
-                # Mark invalid cells
-                if (h, w) in INVALID_OCC_CELLS:
-                    axes[2].text(w, h, 'X', ha='center', va='center', 
-                               fontsize=8, color='red', fontweight='bold')
-                else:
-                    # Show label and highlight if occupied
-                    is_occupied = occ_grid[h, w] == 1
-                    color = 'white' if is_occupied else 'black'
-                    fontweight = 'bold' if is_occupied else 'normal'
-                    axes[2].text(w, h, label, ha='center', va='center', 
-                               fontsize=7, color=color, fontweight=fontweight)
-                    if is_occupied:
-                        occupied_labels.append(label)
-            
-            plt.colorbar(im3, ax=axes[2])
+            occ_vector = np.load(occ_file)
+            active_labels = visualize_occupancy_vector(occ_vector)
+            label_str = ', '.join(active_labels) if active_labels else 'None'
+            axes[2].axis('off')
+            axes[2].set_title(f'Active Capacitors ({len(active_labels)})', fontsize=12, fontweight='bold')
+            axes[2].text(0.5, 0.5, label_str, ha='center', va='center',
+                        transform=axes[2].transAxes, fontsize=9, wrap=True)
         else:
             axes[2].text(0.5, 0.5, 'Occupancy not found', ha='center', va='center', transform=axes[2].transAxes)
-            axes[2].set_title('Occupancy Grid')
-            print(f"✗ Occupancy grid file not found: {occ_file}")
+            axes[2].set_title('Active Capacitors')
+            print(f"✗ Occupancy file not found: {occ_file}")
         
         plt.tight_layout()
         
@@ -260,22 +237,37 @@ def visualize_sample(sample_idx, data_root="datasets/data", show=True, output_pt
     else:
         print(f"✗ Impedance file not found: {impedance_file}")
     
-    # Visualize occupancy grid
+    # Print active capacitor labels from occupancy vector
     if occ_file.exists():
-        print(f"✓ Loading occupancy grid from {occ_file.name}")
-        occupancy_output = None
-        if output_pth:
-            occupancy_dir = output_pth / "occupancy"
-            occupancy_dir.mkdir(parents=True, exist_ok=True)
-            occupancy_output = occupancy_dir / f"sample_{sample_idx}.png"
-        visualize_occupancy_grid(occ_file, output_path=occupancy_output, show=show)
+        active_labels = visualize_occupancy_vector(occ_file)
+        print(f"✓ Active capacitors ({len(active_labels)}): {', '.join(active_labels) if active_labels else 'None'}")
     else:
-        print(f"✗ Occupancy grid file not found: {occ_file}")
+        print(f"✗ Occupancy file not found: {occ_file}")
     
     print(f"\n{'='*60}\n")
 
 
 if __name__ == "__main__":
-    # Interactive mode - no arguments needed
-    viewer = InteractiveSampleViewer(data_root="datasets/data", output_pth=None)
-    viewer.run()
+    # ============================================================
+    # CONFIGURATION
+    # ============================================================
+    DATA_ROOT = "datasets/data_norm"  # Dataset directory
+    SAMPLE_NUMBER = None               # Set to a specific sample number (e.g. 100 for sample_100.npy)
+                                      # Set to None for interactive mode (keyboard navigation)
+    # ============================================================
+
+    if SAMPLE_NUMBER is not None:
+        # Jump directly to the specified sample
+        viewer = InteractiveSampleViewer(data_root=DATA_ROOT, output_pth=None)
+        if SAMPLE_NUMBER in viewer.samples:
+            viewer.current_index = viewer.samples.index(SAMPLE_NUMBER)
+        else:
+            print(f"⚠️  Sample {SAMPLE_NUMBER} not found. Starting at closest available sample.")
+            closest = min(viewer.samples, key=lambda x: abs(x - SAMPLE_NUMBER))
+            viewer.current_index = viewer.samples.index(closest)
+            print(f"   Using sample {closest} instead.")
+        viewer.visualize_current_sample()
+    else:
+        # Interactive mode - start from first sample
+        viewer = InteractiveSampleViewer(data_root=DATA_ROOT, output_pth=None)
+        viewer.run()
