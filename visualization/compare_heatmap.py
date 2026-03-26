@@ -22,14 +22,14 @@ from pathlib import Path
 stats_type = "percentile_min_max"  # Options: "percentile_min_max", "global_min_max"
 
 # Define input directory and output path
-input_dir = Path("experiments/exp012/visuals")
+input_dir = Path("temp_visuals")
 OUTPUT_PATH = input_dir / "generated_vs_real_heatmap.png"
 
 # 2. Automate the list creation
 # This creates a list for indices 0, 1, and 2
 COMPARISONS = [
     {
-        "generated": input_dir / f"data_sample_{i}" / "heatmap.npy",
+        "generated": input_dir / f"data_sample_{i}" / "heatmap_physical.npy",
         "real": input_dir / f"data_sample_{i}" / "Real_Heatmap.map/PI/Power_GND/Z_0063.000MHz.map",
         "label": f"data_sample_{i}"
     }
@@ -40,7 +40,7 @@ COMPARISONS = [
 MASK_PATH = Path("configs/binary_mask.npy")
 
 # Normalization stats path (for min-max color limits)
-NORMALIZATION_STATS_PATH = Path("datasets/source/data_norm/normalization_stats.json")
+#NORMALIZATION_STATS_PATH = Path("datasets/source/data_norm/normalization_stats.json")
 
 # Colormap settings
 CMAP = "jet"
@@ -110,20 +110,14 @@ def load_map_file(file_path, resolution=64):
     return Zi
 
 
-def load_generated_heatmap(file_path,stats=None, stats_type="percentile_min_max"):
+def load_generated_heatmap(file_path):
     """
     Load generated heatmap from .npy file.
-    Returns: 2D numpy array
+    Returns: 2D numpy array (already denormalized)
     """
     data = np.load(file_path)
     if data.ndim == 3:
         data = data[0]  # Take first channel if 3D
-
-    # denormalize the generated heatmap
-    if stats is not None:
-        heatmap_min = stats[stats_type]['heatmap_min']
-        heatmap_max = stats[stats_type]['heatmap_max']
-        data = data * (heatmap_max - heatmap_min) + heatmap_min
     return data
 
 
@@ -140,19 +134,31 @@ def plot_comparison(comparisons_data, mask, output_path):
     if n_comparisons == 1:
         axes = [axes]
     
-    # Create discrete colormap with 22 levels from 0 to 3.35
-    n_levels = 22
-    vmin = 0.0
-    vmax = 3.35
-    boundaries = np.linspace(vmin, vmax, n_levels + 1)
-    cmap = plt.get_cmap(CMAP, n_levels).copy()
-    cmap.set_bad("white")
-    norm = colors.BoundaryNorm(boundaries, cmap.N)
-    
     for row_idx, data in enumerate(comparisons_data):
         real = data['real']
         generated = data['generated']
         label = data['label']
+        
+        # Calculate min/max for real heatmap data
+        real_min = real.min()
+        real_max = real.max()
+        
+        # Calculate min/max for generated heatmap data
+        gen_min = generated.min()
+        gen_max = generated.max()
+        
+        # Create colormap and norm for real data
+        n_levels = 22
+        real_boundaries = np.linspace(real_min, real_max, n_levels + 1)
+        real_cmap = plt.get_cmap(CMAP, n_levels).copy()
+        real_cmap.set_bad("white")
+        real_norm = colors.BoundaryNorm(real_boundaries, real_cmap.N)
+        
+        # Create colormap and norm for generated data
+        gen_boundaries = np.linspace(gen_min, gen_max, n_levels + 1)
+        gen_cmap = plt.get_cmap(CMAP, n_levels).copy()
+        gen_cmap.set_bad("white")
+        gen_norm = colors.BoundaryNorm(gen_boundaries, gen_cmap.N)
         
         # Apply mask
         real_masked = np.ma.masked_where(~mask, real)
@@ -166,8 +172,8 @@ def plot_comparison(comparisons_data, mask, output_path):
         ax_real = axes[row_idx][0]
         img_real = ax_real.imshow(
             real_masked,
-            cmap=cmap,
-            norm=norm,
+            cmap=real_cmap,
+            norm=real_norm,
             interpolation="bicubic",
             aspect="equal"
         )
@@ -180,8 +186,8 @@ def plot_comparison(comparisons_data, mask, output_path):
         ax_gen = axes[row_idx][1]
         img_gen = ax_gen.imshow(
             generated_masked,
-            cmap=cmap,
-            norm=norm,
+            cmap=gen_cmap,
+            norm=gen_norm,
             interpolation="bicubic",
             aspect="equal"
         )
@@ -234,17 +240,17 @@ def main():
     print(f"Loaded mask: {mask.shape}")
     
     # Load normalization stats
-    stats_path = repo_root / NORMALIZATION_STATS_PATH
-    norm_stats = load_normalization_stats(stats_path)
-    stats = norm_stats.get(stats_type, norm_stats[stats_type])  # Use specified stats type or default 
-    print(f"Loaded normalization stats - heatmap min: {stats['heatmap_min']:.4f}, max: {stats['heatmap_max']:.4f}")
+   # stats_path = repo_root / NORMALIZATION_STATS_PATH
+    #norm_stats = load_normalization_stats(stats_path)
+    #stats = norm_stats.get(stats_type, norm_stats[stats_type])  # Use specified stats type or default 
+    #print(f"Loaded normalization stats - heatmap min: {stats['heatmap_min']:.4f}, max: {stats['heatmap_max']:.4f}")
     
     # Load all comparisons
     comparisons_data = []
     for comp in COMPARISONS:
         # Load generated heatmap
         gen_path = repo_root / comp["generated"]
-        generated = load_generated_heatmap(gen_path, stats=norm_stats, stats_type=stats_type)
+        generated = load_generated_heatmap(gen_path)
         print(f"Loaded generated heatmap for {comp['label']}: {generated.shape}")
         
         # Load real heatmap from .map file

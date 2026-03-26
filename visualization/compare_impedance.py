@@ -8,24 +8,21 @@ in subplots for easy visual analysis.
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-import json
 
 # ============================================================
 # CONFIGURATION - Update these paths for your comparisons
 # ============================================================
 
-# Denormalization stats parameter (use "percentile_min_max" to match training data normalization)
-stats_type = "percentile_min_max"  # Options: "percentile_min_max", "global_min_max"
-
 # Define input directory and output path
-input_dir = Path("experiments/exp012/visuals")
+input_dir = Path("temp_visuals")
 OUTPUT_PATH = input_dir / "generated_vs_real_impedance_profile.png"
 
 # 2. Automate the list creation
-# This creates a list for indices 1, 2, and 3
+# This creates a list for indices 0, 1, 2, 3, and 4
 COMPARISONS = [
     {
-        "generated": input_dir / f"data_sample_{i}" / "impedance_profile.npy",
+        "generated": input_dir / f"data_sample_{i}" / "impedance_integrated.npy",
+        "derivative": input_dir / f"data_sample_{i}" / "impedance_derivative.npy",
         "real": input_dir / f"data_sample_{i}" / "Real_Imp.csv",
         "label": f"data_sample_{i}"
     }
@@ -38,45 +35,11 @@ TARGET_IMPEDANCE_PATH = Path("configs/target_impedance.npy")
 # Frequency data path
 FREQUENCY_PATH = Path("configs/Frequency_data_hz.npy")
 
-# Normalization stats (for denormalizing real data if needed)
-NORMALIZATION_STATS_PATH = Path("datasets/source/data_norm/normalization_stats.json")
-
 
 # ============================================================
 
 
-def load_normalization_stats(stats_path):
-    """Load normalization statistics."""
-    with open(stats_path, 'r') as f:
-        stats = json.load(f)
-    return stats
-
-
-def denormalize_impedance(normalized_data, stats, stats_type=None):
-    """
-    Denormalize impedance data using log-scale inverse transformation.
-    
-    The impedance was normalized as:
-        1. log_data = np.log(original_impedance)
-        2. normalized = (log_data - log_min) / (log_max - log_min)
-    
-    To denormalize:
-        1. log_data = normalized * (log_max - log_min) + log_min
-        2. original_impedance = np.exp(log_data)
-    """
-    norm_stats = stats[stats_type]
-    log_min = norm_stats['imp_log_min']
-    log_max = norm_stats['imp_log_max']
-    
-    # Step 1: Scale from [0, 1] back to log-space
-    log_data = normalized_data * (log_max - log_min) + log_min
-    # Step 2: Exponentiate to get original Ohm scale
-    denormalized = np.exp(log_data)
-    
-    return denormalized
-
-
-def load_impedance(path,stats=None, stats_type=None):
+def load_impedance(path):
     """Load impedance from CSV or NPY file."""
     path = Path(path)
     if path.suffix == '.csv':
@@ -117,12 +80,9 @@ def load_impedance(path,stats=None, stats_type=None):
             else:
                 # Use second column if no known column name
                 data = df.iloc[:, 1].values
-                
     elif path.suffix == '.npy':
-        data = np.load(path).flatten()
-        if stats is not None and stats_type is not None:
-            data = denormalize_impedance(data, stats, stats_type)
-            print(f"Denormalized generated data from {path} using stats type: {stats_type}")
+        # impedance_profile.npy is saved in log scale from inference; convert to Ohm
+        data = np.exp(np.load(path).flatten())
     else:
         raise ValueError(f"Unsupported file format: {path.suffix}")
     
@@ -145,6 +105,9 @@ def plot_comparison(frequency, target_impedance, comparisons_data, output_path):
         axes = [axes]
     
     for idx, (ax, data) in enumerate(zip(axes, comparisons_data)):
+        generated = data['generated']
+        real = data['real']
+        
         # Plot target impedance (dashed red)
         ax.loglog(
             frequency, 
@@ -155,32 +118,52 @@ def plot_comparison(frequency, target_impedance, comparisons_data, output_path):
             label='Target'
         )
         
-        # Plot real impedance (solid green)
+        # Plot real impedance (solid blue)
         ax.loglog(
             frequency, 
-            data['real'], 
+            real, 
             linestyle='-', 
             linewidth=1, 
             color='blue', 
             label='Real'
         )
         
-        # Plot generated impedance (solid blue)
+        # Plot generated impedance (solid green)
         ax.loglog(
             frequency, 
-            data['generated'], 
+            generated, 
             linestyle='-', 
             linewidth=1, 
             color='green', 
-            label='Generated'
+            label='Generated (integrated)'
         )
+        
+        # Plot derivative on twin y-axis (dotted orange)
+        derivative = data.get('derivative')
+        if derivative is not None:
+            ax2 = ax.twinx()
+            ax2.semilogx(
+                frequency,
+                derivative,
+                linestyle=':',
+                linewidth=1.2,
+                color='darkorange',
+                label='Derivative (z-score)'
+            )
+            ax2.axhline(0, color='darkorange', linewidth=0.6, linestyle=':', alpha=0.4)
+            ax2.set_ylabel('First Derivative (z-score)', fontsize=11, color='darkorange')
+            ax2.tick_params(axis='y', labelcolor='darkorange')
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, fontsize=10, loc='best')
+        else:
+            ax.legend(fontsize=10, loc='best')
         
         # Formatting
         ax.set_ylim(1e-3, 1e2)
         ax.set_xlabel("Frequency (Hz)", fontsize=12)
         ax.set_ylabel("Impedance (Ohm)", fontsize=12)
         ax.set_title(f"{data['label']}: Generated vs Real", fontsize=14)
-        ax.legend(fontsize=10, loc='best')
         ax.grid(True, which="both", linestyle='--', alpha=0.7)
     
     plt.suptitle("Impedance Profile Comparison", fontsize=16, y=1.02)
@@ -200,10 +183,6 @@ def main():
     script_dir = Path(__file__).resolve().parent
     repo_root = script_dir.parent
     
-    # Load normalization stats
-    normalization_stats = load_normalization_stats(repo_root / NORMALIZATION_STATS_PATH)
-    print(f"Loaded normalization stats from {NORMALIZATION_STATS_PATH}")
-    
     # Load frequency data
     frequency = np.load(repo_root / FREQUENCY_PATH)
     print(f"Loaded frequency data: {frequency.shape}")
@@ -215,22 +194,23 @@ def main():
     # Load all comparisons
     comparisons_data = []
     for comp in COMPARISONS:
-        # Load generated impedance (needs denormalization)
-        generated = load_impedance(
-            repo_root / comp["generated"], 
-            stats=normalization_stats, 
-            stats_type=stats_type
-        )
+        # Load generated impedance (log scale -> exp -> Ohm)
+        generated = load_impedance(repo_root / comp["generated"])
         print(f"Loaded generated impedance for {comp['label']}: {generated.shape}")
+        print(f"  Generated range: [{generated.min():.6e}, {generated.max():.6e}]")
+        
+        # Load derivative (z-score, raw)
+        deriv_path = repo_root / comp["derivative"]
+        derivative = np.load(deriv_path).flatten() if deriv_path.exists() else None
         
         # Load real impedance (already in Ohm scale from CSV)
-        real = load_impedance(
-            repo_root / comp["real"]
-        )
+        real = load_impedance(repo_root / comp["real"])
         print(f"Loaded real impedance for {comp['label']}: {real.shape}")
+        print(f"  Real range: [{real.min():.6e}, {real.max():.6e}]")
         
         comparisons_data.append({
             "generated": generated,
+            "derivative": derivative,
             "real": real,
             "label": comp["label"]
         })

@@ -1,5 +1,5 @@
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend for headless server
+matplotlib.use("WebAgg")  # Opens in browser window
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -21,7 +21,7 @@ output_dir = repo_root / "temp_visuals"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # --- Load normalization stats ---
-norm_root = repo_root / "datasets" / "data_norm"
+norm_root = repo_root / "datasets" / "data_up5_norm"
 stats_file = norm_root / "normalization_stats.json"
 with open(stats_file, "r") as f:
     stats = json.load(f)
@@ -100,7 +100,7 @@ jet_white.set_bad(color="white")  # NaN → white
 
 
 # ---------- FIGURE ----------
-fig, axes = plt.subplots(3, 3, figsize=(18, 14))
+fig, axes = plt.subplots(3, 3, figsize=(14, 10))
 fig.suptitle(f"Normalization Verification — {heatmap_files[SAMPLE_IDX].stem}", fontsize=14, y=0.98)
 
 # ── Row 0: Heatmap ─────────────────────────────────────────────────────
@@ -194,9 +194,10 @@ axes[2, 2].set_title(f"Impedance z-score Distribution (Ch0)\n"
                       f"min={imp_zscore.min():.2f}, max={imp_zscore.max():.2f}")
 axes[2, 2].legend()
 
-plt.tight_layout()
+plt.tight_layout(rect=[0, 0, 1, 0.96])  # type: ignore # Leave space at top for suptitle
 out_path = output_dir / "normalization_verification.png"
 plt.savefig(out_path, dpi=200, bbox_inches="tight")
 print(f"\nSaved to {out_path}")
+plt.show()  # Display plot interactively
 plt.close(fig)
 

@@ -75,8 +75,8 @@ def normalize_heatmaps(heatmap_dir, output_heatmap_dir, heatmap_stats):
         np.save(output_heatmap_dir / path.name, z_ch0[np.newaxis].astype(np.float32))
 
 
-def calculate_impedance_stats(imp_dir, percentile_lower=0.1, percentile_upper=99.9):
-    """Calculate impedance log z-score statistics."""
+def calculate_impedance_stats(imp_dir):
+    """Calculate impedance log z-score statistics (no clipping — all values preserved)."""
     imp_dir = Path(imp_dir)
     stats = {}
     if not imp_dir.exists():
@@ -92,18 +92,16 @@ def calculate_impedance_stats(imp_dir, percentile_lower=0.1, percentile_upper=99
         i_std = 1.0
 
     z_scores = (log_imp - i_mean) / i_std
-    z_clip_min = float(np.percentile(z_scores, percentile_lower))
-    z_clip_max = float(np.percentile(z_scores, percentile_upper))
 
     stats.update({
         "imp_count": len(imp_files),
         "log_mean": i_mean,
         "log_std": i_std,
-        "z_clip_min": z_clip_min,
-        "z_clip_max": z_clip_max,
+        "z_min": float(z_scores.min()),
+        "z_max": float(z_scores.max()),
     })
     print(f"  Impedance log z-score: mean={i_mean:.4f}, std={i_std:.4f}")
-    print(f"  z-score clip bounds (p{percentile_lower}/p{percentile_upper}): [{z_clip_min:.4f}, {z_clip_max:.4f}]")
+    print(f"  z-score range (no clipping): [{z_scores.min():.4f}, {z_scores.max():.4f}]")
     return stats
 
 
@@ -147,8 +145,8 @@ def copy_occupancy(occ_dir, output_occ_dir):
 def main():
     """Main function: 4-step normalization pipeline."""
     root = Path(__file__).resolve().parents[1]
-    data_root = root / "datasets" / "data"
-    output_root = root / "datasets" / "data_norm"
+    data_root = root / "datasets" / "data_up5"
+    output_root = root / "datasets" / "data_up5_norm"
 
     heatmap_dir = data_root / "heatmap"
     imp_dir = data_root / "Imp"
