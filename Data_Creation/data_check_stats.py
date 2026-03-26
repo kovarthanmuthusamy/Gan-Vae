@@ -5,7 +5,7 @@ from scipy import stats
 from tqdm import tqdm
 
 
-def calculate_statistics(data_root="datasets/data"):
+def calculate_statistics(data_root="datasets/data_up5"):
     """Calculate comprehensive statistics for all modalities in the dataset.
     
     Args:

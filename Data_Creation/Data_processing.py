@@ -19,7 +19,7 @@ FRAME_PATH = SCRIPT_DIR.parent / "configs" / "binary_mask.npy"
 # OUTPUT CONFIGURATION
 # Specify where to save the processed dataset
 # ============================================================
-TRAIN_DATA_ROOT = SCRIPT_DIR.parent / "datasets" / "data"
+TRAIN_DATA_ROOT = SCRIPT_DIR.parent / "datasets" / "data_up5"
 OUTPUT_HEATMAP_DIR = TRAIN_DATA_ROOT / "heatmap"
 OUTPUT_IMPEDANCE_DIR = TRAIN_DATA_ROOT / "Imp"
 OUTPUT_OCCUPANCY_DIR = TRAIN_DATA_ROOT / "Occ_map"
@@ -28,12 +28,15 @@ OUTPUT_OCCUPANCY_DIR = TRAIN_DATA_ROOT / "Occ_map"
 # INPUT/SOURCE CONFIGURATION
 # Specify dataset source and file patterns
 # ============================================================
-# New raw data structure: Raw folder contains Heatmap/, Imp/, and decap_combination/ folders
+# Dataset structure:
+#   Dataset/
+#     1_true/  Heatmap/ PI-N/  Imp/ PI-N/  decap  (CSV file)
+#     2_true/  ...
+#     ...
+#     5_true/  ...
 DEFAULT_DATA_ROOT = next((Path(p) for p in [
     os.getenv("DATA_ROOT"),
-    "/mnt/c/Users/muthusamy/Desktop/Raw",
-    "C:/Users/muthusamy/Desktop/Raw",
-    "/home/ubuntu/gan/raw_data"
+    "/mnt/c/Users/muthusamy/Desktop/DataSet"
 ] if p and Path(p).exists()), None)
 
 # ============================================================
@@ -54,113 +57,123 @@ def _read_csv(filepath, cols=None, **kwargs):
 
 def iter_dataset_samples(data_root=None, verbose=True):
     """
-    Iterates through all dataset samples from the new raw data structure.
-    
-    New structure:
-    - Raw/
-        - Heatmap/  (contains heatmap files)
-        - Imp/      (contains impedance files)
-        - decap_combination/  (contains CSV with decap vectors as rows)
-    
-    Files are matched by order: 1st heatmap → 1st impedance → 1st CSV row
+    Iterates through all dataset samples from the multi-folder dataset structure.
+
+    Expected structure:
+        Dataset/
+          1_true/
+            Heatmap/   PI-1/  PI-2/  ...   (*.map files inside)
+            Imp/       PI-1/  PI-2/  ...   (*IC1*.csv files inside)
+            decap                          (CSV file: each row = decap vector for one PI)
+          2_true/  ...   5_true/  ...
+
+    Matching logic per sub-folder:
+      - PI folders are matched between Heatmap/ and Imp/ by shared PI number.
+      - Decap rows are matched to sorted PI numbers by position (row 0 → lowest PI number).
+      - Samples are yielded with a globally incremented sample_id.
     """
     root = Path(data_root) if data_root else DEFAULT_DATA_ROOT
     if not root or not root.exists():
         if verbose:
             print(f"Error: Dataset root not found: {root}")
         return
-    
-    # Define subdirectories
-    heatmap_dir = root / "Heatmap"
-    imp_dir = root / "Imp"
-    decap_dir = root / "decap_combinations"
-    
-    # Validate directories exist
-    if not heatmap_dir.exists():
-        print(f"Error: Heatmap directory not found: {heatmap_dir}")
-        return
-    if not imp_dir.exists():
-        print(f"Error: Impedance directory not found: {imp_dir}")
-        return
-    if not decap_dir.exists():
-        print(f"Error: Decap combination directory not found: {decap_dir}")
-        return
-    
-    # Helper function to extract PI folder number
+
+    # Helper: extract integer from a "PI-N" path component
     def extract_pi_number(path):
-        """Extract number from PI-* folder in path"""
-        for part in path.parts:
-            if part.startswith('PI-'):
+        for part in Path(path).parts:
+            if part.upper().startswith('PI-'):
                 try:
                     return int(part.split('-')[1])
                 except (ValueError, IndexError):
                     pass
         return None
-    
-    # Get all heatmap files recursively (PI-*/PowerGround/*.map or similar)
-    heatmap_all_files = [f for f in heatmap_dir.rglob('*') if f.is_file() and f.suffix.lower() == '.map']
-    
-    # Get all impedance files recursively (PI-*/PowerGround/*.csv) - only those with IC1 in name
-    impedance_all_files = [f for f in imp_dir.rglob('*.csv') if f.is_file() and 'IC1' in f.name]
-    
-    # Build dictionaries keyed by PI number
-    heatmap_dict = {}
-    for f in heatmap_all_files:
-        pi_num = extract_pi_number(f)
-        if pi_num is not None:
-            heatmap_dict[pi_num] = f
-    
-    impedance_dict = {}
-    for f in impedance_all_files:
-        pi_num = extract_pi_number(f)
-        if pi_num is not None:
-            impedance_dict[pi_num] = f
-    
-    # Get sorted PI numbers that exist in both heatmap and impedance
-    common_pi_numbers = sorted(set(heatmap_dict.keys()) & set(impedance_dict.keys()))
-    
-    # Get decap combination CSV file(s)
-    decap_csv_files = sorted([f for f in decap_dir.iterdir() if f.is_file() and f.suffix.lower() == '.csv'])
-    
-    if not decap_csv_files:
-        print(f"Error: No CSV files found in {decap_dir}")
+
+    # Find all N_true sub-folders, sorted numerically
+    true_folders = sorted(
+        [d for d in root.iterdir() if d.is_dir() and d.name.endswith('_true')],
+        key=lambda d: int(d.name.split('_')[0])
+    )
+
+    if not true_folders:
+        print(f"Error: No '*_true' sub-folders found in {root}")
         return
-    
-    # Read decap combinations from the first CSV file
-    decap_csv = decap_csv_files[0]
-    try:
-        decap_data = pd.read_csv(decap_csv, header=None)  # No header, pure data rows
-        decap_vectors = decap_data.select_dtypes(include=[np.number]).values.astype(np.float32)
+
+    if verbose:
+        print(f"  Found {len(true_folders)} sub-folders: {[d.name for d in true_folders]}")
+
+    global_idx = 0  # globally unique sequential index across all sub-folders
+
+    for folder in true_folders:
+        heatmap_dir = folder / "heatmaps"
+        imp_dir     = folder / "imp"
+
+        # Locate the decap CSV file directly inside the numbered folder
+        decap_candidates = [
+            f for f in folder.iterdir()
+            if f.is_file() and f.suffix.lower() == '.csv' and 'decap' in f.name.lower()
+        ]
+        if not decap_candidates:
+            print(f"  Warning: No decap file found in {folder.name}, skipping.")
+            continue
+        decap_csv = decap_candidates[0]
+
+        # Validate sub-directories
+        if not heatmap_dir.exists():
+            print(f"  Warning: heatmaps/ not found in {folder.name}, skipping.")
+            continue
+        if not imp_dir.exists():
+            print(f"  Warning: imp/ not found in {folder.name}, skipping.")
+            continue
+
+        # Collect heatmap files keyed by PI number
+        heatmap_dict = {}
+        for f in heatmap_dir.rglob('*'):
+            if f.is_file() and f.suffix.lower() == '.map':
+                pi_num = extract_pi_number(f)
+                if pi_num is not None:
+                    heatmap_dict[pi_num] = f
+
+        # Collect impedance files keyed by PI number (IC1 files only)
+        impedance_dict = {}
+        for f in imp_dir.rglob('*.csv'):
+            if f.is_file() and 'IC1' in f.name:
+                pi_num = extract_pi_number(f)
+                if pi_num is not None:
+                    impedance_dict[pi_num] = f
+
+        # PI numbers present in both Heatmap and Imp
+        common_pi_numbers = sorted(set(heatmap_dict.keys()) & set(impedance_dict.keys()))
+
+        # Load decap vectors from the CSV (each row = one vector)
+        try:
+            decap_data = pd.read_csv(decap_csv)  # first row is header (C1,C2,...,C52)
+            decap_vectors = decap_data.select_dtypes(include=[np.number]).values.astype(np.float32)
+        except Exception as e:
+            print(f"  Error reading decap CSV {decap_csv}: {e}, skipping {folder.name}.")
+            continue
+
+        num_samples = min(len(common_pi_numbers), len(decap_vectors))
+
         if verbose:
-            print(f"  Loaded {len(decap_vectors)} decap vectors from {decap_csv.name}")
-    except Exception as e:
-        print(f"Error reading decap CSV {decap_csv}: {e}")
-        return
-    
-    if verbose:
-        print(f"  Found {len(heatmap_dict)} heatmap PI folders")
-        print(f"  Found {len(impedance_dict)} impedance PI folders")
-        print(f"  Found {len(common_pi_numbers)} matching PI folders")
-        print(f"  Found {len(decap_vectors)} decap vectors")
-    
-    # Match by order - use minimum count
-    num_samples = min(len(common_pi_numbers), len(decap_vectors))
-    
-    if verbose:
-        print(f"  Matching {num_samples} samples by PI folder order")
-    
-    # Generate samples matched by PI folder index
-    for idx in range(num_samples):
-        pi_num = common_pi_numbers[idx]
-        sample = {
-            "sample_id": idx + 1,
-            "pi_number": pi_num,
-            "heatmap_path": heatmap_dict[pi_num],
-            "impedance_path": impedance_dict[pi_num],
-            "decap_vector": decap_vectors[idx],
-            "decap_index": idx
-        }
-        yield sample
+            print(f"\n  [{folder.name}]")
+            print(f"    Heatmap PI folders : {len(heatmap_dict)}")
+            print(f"    Imp PI folders     : {len(impedance_dict)}")
+            print(f"    Common PI folders  : {len(common_pi_numbers)}")
+            print(f"    Decap rows         : {len(decap_vectors)}")
+            print(f"    Samples this folder: {num_samples}")
+
+        for i in range(num_samples):
+            pi_num = common_pi_numbers[i]
+            yield {
+                "sample_id":      global_idx + 1,
+                "source_folder":  folder.name,
+                "pi_number":      pi_num,
+                "heatmap_path":   heatmap_dict[pi_num],
+                "impedance_path": impedance_dict[pi_num],
+                "decap_vector":   decap_vectors[i],
+                "decap_index":    i,
+            }
+            global_idx += 1
 
 _WORKER_MASK_BOARD = None
 
@@ -212,8 +225,8 @@ def create_training_dataset(output_root=TRAIN_DATA_ROOT, data_root=None,
     if max_samples is not None and max_samples < len(all_samples):
         print(f"Limiting to {max_samples} samples (out of {len(all_samples)} available)")
         
-        # Strategy: Always include first 54 and last 54, randomly sample from middle
-        FIRST_N = 54
+        # Strategy: Always include first 1150 and last 54, randomly sample from middle
+        FIRST_N = 1150
         LAST_N = 54
         
         if max_samples <= FIRST_N + LAST_N:
@@ -317,7 +330,7 @@ if __name__ == "__main__":
         
         # Get CSV path from command line or use default
         csv_path = sys.argv[2] if len(sys.argv) > 2 else (
-            DEFAULT_DATA_ROOT / "decap_combinations" / "decap_vectors.csv" 
+            DEFAULT_DATA_ROOT / "1_true" / "decap"
             if DEFAULT_DATA_ROOT else None
         )
     
